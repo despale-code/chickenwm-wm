@@ -1,0 +1,19 @@
+[package]
+name = "chickenwm-wm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+chickenwm-core.workspace = true
+chickenwm-dwm-hook.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+parking_lot.workspace = true
+crossbeam-channel.workspace = true
+wgpu.workspace = true
+windows.workspace = true
