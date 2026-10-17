@@ -24,7 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, GWL_EXSTYLE, GWL_STYLE, HWND_TOPMOST, LWA_ALPHA, SWP_FRAMECHANGED,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA,
     WNDCLASSW,
-    WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_CAPTION, WS_THICKFRAME, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_POPUP,
 };
 
@@ -75,6 +75,42 @@ pub fn disable_native_dwm_transitions(hwnd_u64: u64) {
     }
 }
 
+/// Removes every native frame of a managed window so only ChickenWM's border is visible:
+/// the Windows 11 DWM border (`DWMWA_BORDER_COLOR` = none) and, when `strip_styles` is set, the
+/// caption and the thick resize frame (which DWM paints as a light strip along the top edge).
+/// Returns true if the window's style bits had to change (its client area moved).
+pub fn strip_native_frame(hwnd_u64: u64, strip_styles: bool) -> bool {
+    let hwnd = HWND(hwnd_u64 as *mut core::ffi::c_void);
+    unsafe {
+        let none: u32 = 0xFFFF_FFFE; // DWMWA_COLOR_NONE
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &none as *const u32 as *const core::ffi::c_void,
+            size_of::<u32>() as u32,
+        );
+        if !strip_styles {
+            return false;
+        }
+        let cur = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        let frame = WS_CAPTION.0 | WS_THICKFRAME.0;
+        if cur & frame == 0 {
+            return false;
+        }
+        let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, (cur & !frame) as isize);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+        true
+    }
+}
+
 /// Phase 5.5: Applies opacity (`active_opacity` / `inactive_opacity`), rounded corners (`DWMWA_WINDOW_CORNER_PREFERENCE`),
 /// Acrylic/Mica backdrop (`DWMWA_SYSTEMBACKDROP_TYPE`), and optional titlebar stripping (`WS_CAPTION`).
 pub fn apply_window_decorations(
@@ -105,16 +141,9 @@ pub fn apply_window_decorations(
             size_of::<u32>() as u32,
         );
 
-        // 2b. Windows 11 draws its own 1px frame border on decorated windows; next to our border
-        //     overlay that shows as a second, slightly offset outline. Hide it while we draw
-        //     borders (DWMWA_COLOR_NONE), restore the default otherwise.
-        let native_border: u32 = if general.border_size > 0 { 0xFFFF_FFFE } else { 0xFFFF_FFFF };
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_BORDER_COLOR,
-            &native_border as *const u32 as *const core::ffi::c_void,
-            size_of::<u32>() as u32,
-        );
+        // 2b. Windows' own frame (the 1px DWM border and the thick resize frame) never shows:
+        //     ChickenWM's borders are the only ones.
+        strip_native_frame(hwnd_u64, general.no_titlebars);
 
         // 3. Background blur / Acrylic / Mica via DWMWA_SYSTEMBACKDROP_TYPE
         let backdrop_type: u32 = if !decoration.blur_enabled {
@@ -132,24 +161,6 @@ pub fn apply_window_decorations(
             &backdrop_type as *const u32 as *const core::ffi::c_void,
             size_of::<u32>() as u32,
         );
-
-        // 4. Optional titlebar stripping (`WS_CAPTION`) when configured
-        if general.no_titlebars {
-            let cur_style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
-            if (cur_style & WS_CAPTION.0) != 0 {
-                let new_style = cur_style & !WS_CAPTION.0;
-                let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, new_style as isize);
-                let _ = SetWindowPos(
-                    hwnd,
-                    None,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-                );
-            }
-        }
 
         // 5. Window opacity via WS_EX_LAYERED + SetLayeredWindowAttributes
         let target_opacity = custom_opacity.unwrap_or_else(|| {
@@ -409,7 +420,8 @@ impl BorderOverlayWindow {
                     border_width: general.border_size as f32,
                 });
             }
-            return;
+            // No `return`: the transforms above only live in this process (nothing carries them
+            // into dwm.exe), so in hook mode the overlay below is still what draws the borders.
         }
 
         if general.border_size <= 0 {

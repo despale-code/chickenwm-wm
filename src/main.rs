@@ -68,7 +68,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, GA_ROOT, GWL_EXSTYLE, GWL_STYLE,
     SPI_SETFOREGROUNDLOCKTIMEOUT, SW_RESTORE, SW_SHOWNA,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CLOSE,
-    WS_CAPTION, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_VISIBLE, DispatchMessageW,
+    WS_CAPTION, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_EX_TOOLWINDOW, WS_VISIBLE, DispatchMessageW,
     MsgWaitForMultipleObjects, PeekMessageW, PostThreadMessageW, TranslateMessage, MSG,
     PM_REMOVE, QS_ALLINPUT, WM_NULL, GetWindow, SetCursorPos, SetWindowPos, GW_OWNER, HWND_TOPMOST,
     HWND_NOTOPMOST,
@@ -409,6 +409,29 @@ fn enforce_owned_window_floating(info: &mut ClientInfo) {
     }
 }
 
+/// Screen-capture tools (Snipping Tool's capture overlay) whose windows must never be tiled or
+/// lose focus while open: the overlay cancels the capture as soon as it isn't foreground.
+const SCREEN_CAPTURE_PROCESSES: [&str; 3] = ["SnippingTool.exe", "ScreenClippingHost.exe", "ScreenSketch.exe"];
+
+fn is_screen_capture_process(process_name: &str) -> bool {
+    SCREEN_CAPTURE_PROCESSES.iter().any(|p| p.eq_ignore_ascii_case(process_name))
+}
+
+/// A topmost window ChickenWM doesn't manage (a capture overlay, a game/tool overlay, a picker)
+/// with the cursor over it: focus-follows-mouse must leave it in the foreground. Once the
+/// cursor leaves it (e.g. the bar after a click), hovering a tile focuses that tile again.
+fn is_unmanaged_topmost_at(hwnd: HWND, clients: &HashMap<u64, ClientInfo>, x: i32, y: i32) -> bool {
+    if hwnd.0.is_null() || clients.contains_key(&(hwnd.0 as u64)) {
+        return false;
+    }
+    let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
+    if (ex_style & WS_EX_TOPMOST.0) == 0 {
+        return false;
+    }
+    let mut rc = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut rc) }.is_ok() && x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom
+}
+
 /// True for the `chickenwm-launcher` window (matched by the title its viewport sets).
 fn is_launcher_window(hwnd: HWND) -> bool {
     if hwnd.0.is_null() {
@@ -419,7 +442,6 @@ fn is_launcher_window(hwnd: HWND) -> bool {
     len > 0 && String::from_utf16_lossy(&buf[..len as usize]) == "ChickenWM Launcher"
 }
 
-/// Current visible (DWM extended frame) width and height of `hwnd`.
 /// The visible size the window actually took after a resize. Read from the synchronous window
 /// rect minus the cached shadow margins: `DWMWA_EXTENDED_FRAME_BOUNDS` lags a frame or more
 /// behind, so mid-drag it still reports the previous (larger) size, which made shrinking from a
@@ -1058,6 +1080,11 @@ impl WmState {
         // While the launcher is open it owns the keyboard: moving the mouse over a tile must not
         // pull focus away from its search box.
         if is_launcher_window(fg) {
+            return;
+        }
+        // Same for overlays drawn over everything (Snipping Tool's region picker cancels the
+        // capture the moment it loses focus, and selecting a region means moving the mouse).
+        if is_unmanaged_topmost_at(fg, &self.clients, x, y) {
             return;
         }
         if let Some(hovered_hwnd) = self.find_client_at_point(x, y) {
@@ -2190,6 +2217,13 @@ fn inspect_window(hwnd_u64: u64) -> Option<ClientInfo> {
         {
             return None;
         }
+        // Snipping Tool's capture overlay (topmost, no caption) must stay exactly where it is;
+        // its normal editor window is a regular app and tiles as usual.
+        if is_screen_capture_process(&process_name)
+            && ((ex_style & WS_EX_TOPMOST.0) != 0 || (style & WS_CAPTION.0) == 0)
+        {
+            return None;
+        }
 
         // Query visible frame bounds via DWMWA_EXTENDED_FRAME_BOUNDS or GetWindowRect
         let mut rc = RECT::default();
@@ -2594,6 +2628,18 @@ async fn main() -> Result<()> {
                 last_sweep = std::time::Instant::now();
                 let found = discover_manageable_windows();
                 let mut st = wm_loop.lock();
+                // Apps (and some toolkits on resize/show) put their native frame back; strip it
+                // again so only our borders ever show. If a window's client area moved, re-tile.
+                let strip_styles = st.config.general.no_titlebars;
+                let mut restyled = false;
+                for (&hwnd, c) in &st.clients {
+                    if !c.fullscreen {
+                        restyled |= effects::strip_native_frame(hwnd, strip_styles);
+                    }
+                }
+                if restyled && st.drag_target_hwnd.is_none() {
+                    st.relayout_active_workspace(false);
+                }
                 if st.drag_target_hwnd.is_none() {
                     for info in found {
                         if !st.clients.contains_key(&info.hwnd) && !st.wm_hidden_hwnds.contains(&info.hwnd) {
