@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{BOOL, COLORREF, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_TRANSITIONS_FORCEDISABLED,
+    DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_TRANSITIONS_FORCEDISABLED,
     DWMWA_WINDOW_CORNER_PREFERENCE,
 };
 use windows::Win32::Graphics::Gdi::{
@@ -102,6 +102,17 @@ pub fn apply_window_decorations(
             hwnd,
             DWMWA_WINDOW_CORNER_PREFERENCE,
             &corner_pref as *const u32 as *const core::ffi::c_void,
+            size_of::<u32>() as u32,
+        );
+
+        // 2b. Windows 11 draws its own 1px frame border on decorated windows; next to our border
+        //     overlay that shows as a second, slightly offset outline. Hide it while we draw
+        //     borders (DWMWA_COLOR_NONE), restore the default otherwise.
+        let native_border: u32 = if general.border_size > 0 { 0xFFFF_FFFE } else { 0xFFFF_FFFF };
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &native_border as *const u32 as *const core::ffi::c_void,
             size_of::<u32>() as u32,
         );
 

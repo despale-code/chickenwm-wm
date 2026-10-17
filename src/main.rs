@@ -339,6 +339,44 @@ fn notify_untileable(process: &str) {
     }
     let app = process.trim_end_matches(".exe").trim_end_matches(".EXE").to_string();
     std::thread::spawn(move || {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows::core::PCWSTR;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            MessageBoxW, IDYES, MB_ICONQUESTION, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
+        };
+        // One question at a time, and no more questions once the user said no.
+        static ASKING: AtomicBool = AtomicBool::new(false);
+        static DECLINED: AtomicBool = AtomicBool::new(false);
+        if !DECLINED.load(Ordering::Relaxed) && !ASKING.swap(true, Ordering::SeqCst) {
+            let text: Vec<u16> = format!(
+                "{app} runs as administrator, and Windows only lets an administrator program move its windows.\n\nRestart ChickenWM as administrator so it can tile {app}?\n\n(You'll be asked to approve it. Turn on \"Run ChickenWM as administrator\" in Settings to do this at every sign-in.)"
+            )
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+            let title: Vec<u16> = "ChickenWM".encode_utf16().chain(std::iter::once(0)).collect();
+            let answer = unsafe {
+                MessageBoxW(
+                    None,
+                    PCWSTR(text.as_ptr()),
+                    PCWSTR(title.as_ptr()),
+                    MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND,
+                )
+            };
+            ASKING.store(false, Ordering::SeqCst);
+            if answer == IDYES {
+                match chickenwm_core::ipc::send_ipc_command_blocking(
+                    chickenwm_core::ipc::PIPE_NAME_DAEMON,
+                    &IpcCommand::RestartElevated,
+                ) {
+                    Ok(IpcResponse::Error { message }) => info!("administrator restart not done: {message}"),
+                    Ok(_) => {}
+                    Err(e) => info!("administrator restart failed: {e}"),
+                }
+                return;
+            }
+            DECLINED.store(true, Ordering::Relaxed);
+        }
         let _ = chickenwm_core::ipc::send_ipc_command_blocking(
             chickenwm_core::ipc::PIPE_NAME_NOTIFY,
             &IpcCommand::Notify(chickenwm_core::ipc::Notification {
@@ -382,18 +420,17 @@ fn is_launcher_window(hwnd: HWND) -> bool {
 }
 
 /// Current visible (DWM extended frame) width and height of `hwnd`.
+/// The visible size the window actually took after a resize. Read from the synchronous window
+/// rect minus the cached shadow margins: `DWMWA_EXTENDED_FRAME_BOUNDS` lags a frame or more
+/// behind, so mid-drag it still reports the previous (larger) size, which made shrinking from a
+/// left/top edge snap back as if the app refused.
 fn visible_frame_size(hwnd: u64) -> Option<(i32, i32)> {
     let mut rc = RECT::default();
     unsafe {
-        DwmGetWindowAttribute(
-            HWND(hwnd as *mut core::ffi::c_void),
-            DWMWA_EXTENDED_FRAME_BOUNDS,
-            &mut rc as *mut RECT as *mut core::ffi::c_void,
-            size_of::<RECT>() as u32,
-        )
-        .ok()?;
+        GetWindowRect(HWND(hwnd as *mut core::ffi::c_void), &mut rc).ok()?;
     }
-    Some((rc.right - rc.left, rc.bottom - rc.top))
+    let [l, t, r, b] = animator::get_dwm_frame_margins(hwnd);
+    Some((rc.right - rc.left - l - r, rc.bottom - rc.top - t - b))
 }
 
 /// Moves one side of the span `[pos, pos + len)` by `delta`: the start side when `edge < 0`,
@@ -2239,6 +2276,13 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // The daemon's HIGH priority class isn't inherited by the processes it starts: claim it here
+    // so layout and animation work isn't queued behind a busy game.
+    unsafe {
+        use windows::Win32::System::Threading::{GetCurrentProcess, SetPriorityClass, HIGH_PRIORITY_CLASS};
+        let _ = SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+    }
+
     // Zero out Windows foreground lock timeout so focus-follows-mouse (`SetForegroundWindow`) succeeds immediately
     unsafe {
         let _ = SystemParametersInfoW(
@@ -2425,6 +2469,16 @@ async fn main() -> Result<()> {
 
         let mut scheduler = AdaptiveFrameScheduler::new(pacer_loop.clone());
         WM_LOOP_THREAD_ID.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
+        // Frame deadlines: register this loop with the multimedia scheduler (MMCSS) so a game
+        // loading the CPU can't starve it between frames. It sleeps while idle, so the boost
+        // only applies while something is animating.
+        unsafe {
+            let mut task_index = 0u32;
+            let _ = windows::Win32::System::Threading::AvSetMmThreadCharacteristicsW(
+                windows::core::w!("DisplayPostProcessing"),
+                &mut task_index,
+            );
+        }
         let mut last_sweep = std::time::Instant::now();
         loop {
             // Windows owned by this thread (border overlay, resize previews) need their messages
