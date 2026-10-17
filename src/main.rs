@@ -7,12 +7,16 @@
 //! - 5.5: Transparencies, Blur/Acrylic/Mica, Rounded Corners, and Animated Gradient Border Overlay
 //! - 5.6: Multi-Monitor Virtual Workspaces (`1..10`) & `windowrulev2` Engine
 
+// Release builds are windowed apps: no console window when launched from the shell, a
+// hotkey or the launcher. Debug builds keep the console for logs.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod animator;
 mod effects;
 mod layout;
 mod resize_preview;
 
-use crate::animator::AnimationEngine;
+use crate::animator::{apply_atomic_window_positions, AnimationEngine};
 use crate::effects::{apply_window_decorations, BorderOverlayWindow, WindowBorderTarget};
 use crate::layout::{compute_workspace_layout, tiled_inner_area, BspNode, SplitAxis};
 use anyhow::Result;
@@ -21,7 +25,7 @@ use chickenwm_core::bootstrap_config_and_themes;
 use chickenwm_core::config::{load_or_init_config, HyprConfig, WindowRuleV2};
 use chickenwm_core::css::{spawn_config_watcher, ConfigWatchEvent};
 use chickenwm_core::failsafe::{
-    clear_hidden_by_chickenwm, mark_hidden_by_chickenwm, spawn_emergency_failsafe_thread,
+    mark_hidden_by_chickenwm, spawn_emergency_failsafe_thread,
 };
 use chickenwm_core::frame_scheduler::{AdaptiveFrameScheduler, FramePacerControl};
 use chickenwm_core::handles::SafeHandle;
@@ -62,7 +66,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED,
     EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
     EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, GA_ROOT, GWL_EXSTYLE, GWL_STYLE,
-    SPI_SETFOREGROUNDLOCKTIMEOUT, SW_HIDE, SW_RESTORE, SW_SHOWNA,
+    SPI_SETFOREGROUNDLOCKTIMEOUT, SW_RESTORE, SW_SHOWNA,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CLOSE,
     WS_CAPTION, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_VISIBLE, DispatchMessageW,
     MsgWaitForMultipleObjects, PeekMessageW, PostThreadMessageW, TranslateMessage, MSG,
@@ -285,6 +289,67 @@ fn is_owned_window(hwnd: u64) -> bool {
         let len = GetClassNameW(hwnd, &mut class);
         len > 0 && String::from_utf16_lossy(&class[..len as usize]) == "#32770"
     }
+}
+
+/// Whether `pid` runs with a higher privilege level than we do (e.g. "Run as administrator").
+/// Windows blocks moving or resizing such windows from a normal process (UIPI), so they can't
+/// be tiled.
+fn is_more_privileged(pid: u32) -> bool {
+    use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    fn elevated(process: windows::Win32::Foundation::HANDLE) -> Option<bool> {
+        unsafe {
+            let mut token = windows::Win32::Foundation::HANDLE::default();
+            OpenProcessToken(process, TOKEN_QUERY, &mut token).ok()?;
+            let mut info = TOKEN_ELEVATION::default();
+            let mut len = 0u32;
+            let ok = GetTokenInformation(
+                token,
+                TokenElevation,
+                Some(&mut info as *mut _ as *mut core::ffi::c_void),
+                size_of::<TOKEN_ELEVATION>() as u32,
+                &mut len,
+            )
+            .is_ok();
+            let _ = windows::Win32::Foundation::CloseHandle(token);
+            ok.then_some(info.TokenIsElevated != 0)
+        }
+    }
+    static SELF_ELEVATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *SELF_ELEVATED.get_or_init(|| elevated(unsafe { GetCurrentProcess() }).unwrap_or(false)) {
+        return false;
+    }
+    unsafe {
+        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
+        };
+        // An elevated process' token can't be opened from a normal one: treat that as elevated.
+        let result = elevated(handle).unwrap_or(true);
+        let _ = windows::Win32::Foundation::CloseHandle(handle);
+        result
+    }
+}
+
+/// Tells the user (once per app) why an administrator window floats.
+fn notify_untileable(process: &str) {
+    static TOLD: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    let told = TOLD.get_or_init(Default::default);
+    if !told.lock().insert(process.to_ascii_lowercase()) {
+        return;
+    }
+    let app = process.trim_end_matches(".exe").trim_end_matches(".EXE").to_string();
+    std::thread::spawn(move || {
+        let _ = chickenwm_core::ipc::send_ipc_command_blocking(
+            chickenwm_core::ipc::PIPE_NAME_NOTIFY,
+            &IpcCommand::Notify(chickenwm_core::ipc::Notification {
+                app: "ChickenWM".into(),
+                title: format!("{app} runs as administrator"),
+                body: "Windows doesn't let ChickenWM move administrator windows, so it floats instead of tiling. Open it without \"Run as administrator\" to tile it.".into(),
+                timeout_secs: Some(10),
+                urgency: None,
+            }),
+        );
+    });
 }
 
 /// Owned windows always float and always stay above normal windows, regardless of window rules.
@@ -554,20 +619,13 @@ impl WmState {
     /// Undoes [`Self::mark_ws_hidden`] when the window is shown again or goes away.
     fn unmark_ws_hidden(&mut self, hwnd: u64) {
         self.wm_hidden_hwnds.remove(&hwnd);
-        clear_hidden_by_chickenwm(hwnd);
+        chickenwm_core::failsafe::unpark_window(hwnd);
     }
 
-    /// Restores visibility to any windows that were hidden on inactive workspaces.
+    /// Brings back every window parked (or, from older builds, hidden) for an inactive
+    /// workspace, at the position it had before.
     fn restore_all_hidden_windows(&mut self) {
-        unsafe {
-            for &hwnd_u64 in &self.wm_hidden_hwnds {
-                let hwnd = HWND(hwnd_u64 as *mut core::ffi::c_void);
-                clear_hidden_by_chickenwm(hwnd_u64);
-                if IsWindow(hwnd).as_bool() {
-                    let _ = ShowWindow(hwnd, SW_SHOWNA);
-                }
-            }
-        }
+        chickenwm_core::failsafe::restore_all_desktop_windows();
         self.wm_hidden_hwnds.clear();
     }
 
@@ -578,6 +636,10 @@ impl WmState {
             info.workspace_id = self.active_workspace;
             self.apply_window_rules(&mut info);
             enforce_owned_window_floating(&mut info);
+            if !info.floating && is_more_privileged(info.pid) {
+                info.floating = true;
+                notify_untileable(&info.process_name);
+            }
             self.detect_app_fullscreen(&mut info);
             let ws = info.workspace_id;
             let hwnd = info.hwnd;
@@ -589,9 +651,7 @@ impl WmState {
             // If a window rule assigned this window to an inactive workspace on boot, hide it cleanly
             if ws != self.active_workspace && !info.pinned {
                 self.mark_ws_hidden(hwnd);
-                unsafe {
-                    let _ = ShowWindow(HWND(hwnd as *mut core::ffi::c_void), SW_HIDE);
-                }
+                chickenwm_core::failsafe::park_window(hwnd);
             }
             self.clients.insert(hwnd, info);
             if !is_float {
@@ -688,6 +748,10 @@ impl WmState {
         info.workspace_id = self.active_workspace;
         self.apply_window_rules(&mut info);
         enforce_owned_window_floating(&mut info);
+        if !info.floating && is_more_privileged(info.pid) {
+            info.floating = true;
+            notify_untileable(&info.process_name);
+        }
         self.detect_app_fullscreen(&mut info);
 
         let ws = info.workspace_id;
@@ -716,9 +780,7 @@ impl WmState {
             self.relayout_active_workspace_with_new(Some((hwnd, initial_rect)), 0);
         } else {
             self.mark_ws_hidden(hwnd);
-            unsafe {
-                let _ = ShowWindow(HWND(hwnd as *mut core::ffi::c_void), SW_HIDE);
-            }
+            chickenwm_core::failsafe::park_window(hwnd);
         }
         self.broadcast_bar_state();
     }
@@ -1251,7 +1313,10 @@ impl WmState {
     ) {
         let ws = self.active_workspace;
         let work_area = self.primary_work_area();
-        let slide_offset_x = workspace_slide_dir * (work_area[2] / 6);
+        let slide_offset_x = workspace_slide_dir * self.workspace_slide_distance();
+        // Incoming windows are placed at their slide start *before* they're shown (no flash at
+        // the old spot), then glide in.
+        let mut pre_position: Vec<(u64, [i32; 4])> = Vec::new();
 
         // Check if any window on active workspace is fullscreen
         if let Some((&fs_hwnd, fs_client)) = self
@@ -1264,9 +1329,11 @@ impl WmState {
             let mut from = fs_client.rect;
             if workspace_slide_dir != 0 {
                 from[0] = screen[0] + slide_offset_x;
+                apply_atomic_window_positions(&[(fs_hwnd, from)], false);
+                self.animator.animate_workspace(fs_hwnd, from, screen, false, &self.config);
+            } else {
+                self.animator.animate_window(fs_hwnd, from, screen, false, &self.config);
             }
-            self.animator
-                .animate_window(fs_hwnd, from, screen, false, &self.config);
             if let Some(c) = self.clients.get_mut(&fs_hwnd) {
                 c.rect = screen;
             }
@@ -1321,8 +1388,13 @@ impl WmState {
             if let Some(c) = self.clients.get_mut(&hwnd) {
                 c.rect = target_rect;
             }
-            self.animator
-                .animate_window(hwnd, from_rect, target_rect, is_open, &self.config);
+            if workspace_slide_dir != 0 && !is_open {
+                pre_position.push((hwnd, from_rect));
+                self.animator.animate_workspace(hwnd, from_rect, target_rect, false, &self.config);
+            } else {
+                self.animator
+                    .animate_window(hwnd, from_rect, target_rect, is_open, &self.config);
+            }
         }
 
         // Also animate/position floating windows on the active workspace when switching workspaces
@@ -1340,9 +1412,24 @@ impl WmState {
                     target_rect[2],
                     target_rect[3],
                 ];
-                self.animator
-                    .animate_window(hwnd, from_rect, target_rect, false, &self.config);
+                pre_position.push((hwnd, from_rect));
+                self.animator.animate_workspace(hwnd, from_rect, target_rect, false, &self.config);
             }
+        }
+        if !pre_position.is_empty() {
+            apply_atomic_window_positions(&pre_position, false);
+        }
+    }
+
+    /// How far workspaces slide: a full screen width (a carousel: the old workspace leaves as
+    /// the new one arrives) on a single monitor; a short slide when other monitors would show
+    /// windows passing through.
+    fn workspace_slide_distance(&self) -> i32 {
+        let work = self.primary_work_area();
+        if self.monitors.len() <= 1 {
+            work[2] + self.config.general.gaps_out.max(0) * 2
+        } else {
+            work[2] / 5
         }
     }
 
@@ -1375,15 +1462,44 @@ impl WmState {
             self.remove_window(dh);
         }
 
-        // 1. Show windows on target_ws first so the incoming workspace appears seamlessly
+        let slide_dir = if target_ws > old_ws { 1 } else { -1 };
+        let full_slide = self.monitors.len() <= 1;
+        let distance = self.workspace_slide_distance();
+
         let to_show: Vec<u64> = self
             .clients
             .values()
             .filter(|c| c.workspace_id == target_ws && !c.pinned)
             .map(|c| c.hwnd)
             .collect();
-        for hwnd_u64 in to_show {
+        for &hwnd_u64 in &to_show {
             self.unmark_ws_hidden(hwnd_u64);
+        }
+
+        // 1. Old workspace: slide out the opposite way and hide at the end (carousel), or hide
+        //    right away when a full-width slide would cross another monitor. Windows are marked
+        //    in `wm_hidden_hwnds` BEFORE hiding so the resulting `EVENT_OBJECT_HIDE` doesn't
+        //    drop them from `self.clients`.
+        let to_hide: Vec<(u64, [i32; 4])> = self
+            .clients
+            .values()
+            .filter(|c| c.workspace_id == old_ws && !c.pinned)
+            .map(|c| (c.hwnd, c.rect))
+            .collect();
+        for (hwnd_u64, rect) in to_hide {
+            self.mark_ws_hidden(hwnd_u64);
+            if full_slide {
+                let out = [rect[0] - slide_dir * distance, rect[1], rect[2], rect[3]];
+                self.animator.animate_workspace(hwnd_u64, rect, out, true, &self.config);
+            } else {
+                self.animator.remove_window(hwnd_u64);
+                chickenwm_core::failsafe::park_window(hwnd_u64);
+            }
+        }
+
+        // 2. New workspace: lay out (this parks each window at its slide start), then show.
+        self.relayout_active_workspace_with_new(None, slide_dir);
+        for hwnd_u64 in to_show {
             let hwnd = HWND(hwnd_u64 as *mut core::ffi::c_void);
             unsafe {
                 if IsIconic(hwnd).as_bool() {
@@ -1391,23 +1507,6 @@ impl WmState {
                 } else {
                     let _ = ShowWindow(hwnd, SW_SHOWNA);
                 }
-            }
-        }
-
-        // 2. Hide windows on old_ws (marking them in `wm_hidden_hwnds` BEFORE `ShowWindow(SW_HIDE)`
-        //    so the resulting `EVENT_OBJECT_HIDE` WinEvent does NOT delete them from `self.clients`!)
-        let to_hide: Vec<u64> = self
-            .clients
-            .values()
-            .filter(|c| c.workspace_id == old_ws && !c.pinned)
-            .map(|c| c.hwnd)
-            .collect();
-        for hwnd_u64 in to_hide {
-            self.mark_ws_hidden(hwnd_u64);
-            self.animator.remove_window(hwnd_u64);
-            let hwnd = HWND(hwnd_u64 as *mut core::ffi::c_void);
-            unsafe {
-                let _ = ShowWindow(hwnd, SW_HIDE);
             }
         }
 
@@ -1435,9 +1534,6 @@ impl WmState {
             force_foreground_window(HWND(fh as *mut core::ffi::c_void));
         }
 
-        // 4. Animate incoming workspace windows with directional slide
-        let slide_dir = if target_ws > old_ws { 1 } else { -1 };
-        self.relayout_active_workspace_with_new(None, slide_dir);
 
         // 5. Immediately synchronize workspace indicator with `roobar`
         info!("Switched workspace {} -> {}", old_ws, target_ws);
@@ -1824,9 +1920,7 @@ impl WmState {
         } else {
             self.mark_ws_hidden(hwnd);
             self.animator.remove_window(hwnd);
-            unsafe {
-                let _ = ShowWindow(HWND(hwnd as *mut core::ffi::c_void), SW_HIDE);
-            }
+            chickenwm_core::failsafe::park_window(hwnd);
             let next_focus = self
                 .workspace_order
                 .get(&old_ws)
@@ -2053,6 +2147,7 @@ fn inspect_window(hwnd_u64: u64) -> Option<ClientInfo> {
         }
 
         if process_name.eq_ignore_ascii_case("chickenwm-launcher.exe")
+            || process_name.eq_ignore_ascii_case("chickenwm-notify.exe")
             || process_name.eq_ignore_ascii_case("roobar.exe")
             || title.starts_with("ChickenWM Bar")
         {
@@ -2330,6 +2425,7 @@ async fn main() -> Result<()> {
 
         let mut scheduler = AdaptiveFrameScheduler::new(pacer_loop.clone());
         WM_LOOP_THREAD_ID.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
+        let mut last_sweep = std::time::Instant::now();
         loop {
             // Windows owned by this thread (border overlay, resize previews) need their messages
             // dispatched; an unpumped top-level window also stalls system-wide broadcasts such as
@@ -2391,7 +2487,15 @@ async fn main() -> Result<()> {
                         if let Some(ws) = st.clients.get(&h).map(|c| c.workspace_id) {
                             if ws == st.active_workspace {
                                 st.set_focus(Some(h));
+                            } else if st.wm_hidden_hwnds.contains(&h) {
+                                // A parked window was activated (Alt+Tab, a notification…):
+                                // go to it instead of leaving focus on something off-screen.
+                                st.switch_workspace(ws);
+                                st.set_focus(Some(h));
                             }
+                        } else {
+                            // A window we never saw become eligible just took focus: adopt it now.
+                            st.add_or_show_window(h);
                         }
                     }
                     WmEvent::WinMoveSizeStart(h) => {
@@ -2423,6 +2527,24 @@ async fn main() -> Result<()> {
                             st.config = new_cfg;
                             st.relayout_active_workspace(false);
                             st.broadcast_bar_state();
+                        }
+                    }
+                }
+            }
+
+            // Safety net for windows the event hooks miss: apps that show a window before it has
+            // a title, reveal it through layered/alpha changes (no SHOW event), or were briefly
+            // cloaked (Steam, Electron/CEF and SDL apps). Every visible, eligible top-level window
+            // that isn't managed yet gets adopted.
+            if last_sweep.elapsed() >= std::time::Duration::from_millis(1500) {
+                last_sweep = std::time::Instant::now();
+                let found = discover_manageable_windows();
+                let mut st = wm_loop.lock();
+                if st.drag_target_hwnd.is_none() {
+                    for info in found {
+                        if !st.clients.contains_key(&info.hwnd) && !st.wm_hidden_hwnds.contains(&info.hwnd) {
+                            info!("adopting untracked window {:?} ({}, {})", info.title, info.class, info.process_name);
+                            st.add_or_show_window(info.hwnd);
                         }
                     }
                 }

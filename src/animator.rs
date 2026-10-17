@@ -7,7 +7,7 @@
 use crate::resize_preview::ResizePreviews;
 use chickenwm_core::config::{BezierCurve, HyprConfig};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
 use std::sync::OnceLock;
 use windows::Win32::Foundation::{HWND, RECT};
@@ -122,6 +122,8 @@ pub struct AnimationEngine {
     overlay_host_hwnd: Option<u64>,
     /// Stretched stand-ins for windows being mouse-resized with preview (see `resize_preview`).
     pub previews: ResizePreviews,
+    /// Windows sliding out with their old workspace; hidden when their slide finishes.
+    hide_on_finish: HashSet<u64>,
 }
 
 impl AnimationEngine {
@@ -130,6 +132,7 @@ impl AnimationEngine {
             active: HashMap::new(),
             overlay_host_hwnd: None,
             previews: ResizePreviews::default(),
+            hide_on_finish: HashSet::new(),
         }
     }
 
@@ -168,6 +171,54 @@ impl AnimationEngine {
         self.animate_window_rule(hwnd, from_rect, target_rect, rule_name, is_open, cfg);
     }
 
+    /// Workspace switch slide (the `workspaces` animation rule). Overshooting curves (like the
+    /// default `myBezier`) make a whole workspace bounce, so those are replaced with a smooth
+    /// deceleration; timing never drops below ~250 ms so switches don't feel abrupt.
+    /// With `hide_after`, the window is hidden when the slide ends (outgoing workspace).
+    pub fn animate_workspace(&mut self, hwnd: u64, from_rect: [i32; 4], target_rect: [i32; 4], hide_after: bool, cfg: &HyprConfig) {
+        let rule = cfg.animation_rules.iter().find(|r| r.name.eq_ignore_ascii_case("workspaces"));
+        if !cfg.animations.enabled || rule.is_some_and(|r| !r.enabled) {
+            self.active.remove(&hwnd);
+            self.hide_on_finish.remove(&hwnd);
+            apply_atomic_window_positions(&[(hwnd, target_rect)], false);
+            if hide_after {
+                chickenwm_core::failsafe::park_window(hwnd);
+            }
+            return;
+        }
+        let glide = BezierCurve { name: "workspaceGlide".into(), x0: 0.22, y0: 1.0, x1: 0.36, y1: 1.0 };
+        let (duration_secs, curve) = match rule {
+            Some(r) => {
+                let c = cfg.find_bezier(&r.curve);
+                let overshoots = c.y0 > 1.0 || c.y1 > 1.0 || c.y0 < 0.0 || c.y1 < 0.0;
+                ((r.speed * 0.085).clamp(0.25, 0.9), if overshoots { glide } else { c })
+            }
+            None => (0.42, glide),
+        };
+        // Continue from wherever the window is now (rapid switching back and forth).
+        let start = self
+            .active
+            .get(&hwnd)
+            .map(|a| a.current_rect)
+            .unwrap_or(from_rect)
+            .map(|v| v as f32);
+        self.hide_on_finish.remove(&hwnd);
+        if hide_after {
+            self.hide_on_finish.insert(hwnd);
+        }
+        self.active.insert(
+            hwnd,
+            WindowAnimation {
+                start_rect: start,
+                target_rect: target_rect.map(|v| v as f32),
+                current_rect: start.map(|v| v as i32),
+                elapsed_secs: 0.0,
+                duration_secs,
+                curve,
+            },
+        );
+    }
+
     /// Glides a tile into the slot it was swapped into during a Super+drag. Uses the
     /// `windowsSwap` animation rule if configured, otherwise a symmetric ease-in-out.
     pub fn animate_swap(&mut self, hwnd: u64, from_rect: [i32; 4], target_rect: [i32; 4], cfg: &HyprConfig) {
@@ -183,6 +234,8 @@ impl AnimationEngine {
         is_open: bool,
         cfg: &HyprConfig,
     ) {
+        // A regular move supersedes a pending "hide after the workspace slide".
+        self.hide_on_finish.remove(&hwnd);
         if !cfg.animations.enabled {
             self.active.remove(&hwnd);
             apply_atomic_window_positions(&[(hwnd, target_rect)], false);
@@ -324,12 +377,17 @@ impl AnimationEngine {
             }
         }
 
-        for hwnd in finished {
+        for &hwnd in &finished {
             self.active.remove(&hwnd);
         }
 
         if !commit_batch.is_empty() {
             apply_atomic_window_positions(&commit_batch, false);
+        }
+        for hwnd in finished {
+            if self.hide_on_finish.remove(&hwnd) {
+                chickenwm_core::failsafe::park_window(hwnd);
+            }
         }
 
         current_visible_rects
@@ -337,6 +395,7 @@ impl AnimationEngine {
 
     pub fn remove_window(&mut self, hwnd: u64) {
         self.active.remove(&hwnd);
+        self.hide_on_finish.remove(&hwnd);
         invalidate_dwm_frame_margins(hwnd);
     }
 }
