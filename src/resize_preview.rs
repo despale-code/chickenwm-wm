@@ -1,5 +1,5 @@
-//! GPU-stretched resize previews for apps whose renderer can't keep up with live resizing
-//! (Firefox/Zen: its compositor redraws asynchronously, so content trails the frame).
+//! GPU-stretched resize previews, opt-in per window class (`misc:resize_preview_classes`, empty by
+//! default) for apps whose renderer cannot keep up with live resizing.
 //!
 //! While a mouse resize is in progress, the real window is parked off-screen at its original
 //! size and a click-through preview window takes its place, showing a DWM thumbnail of it that

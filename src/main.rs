@@ -12,69 +12,62 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod animator;
+mod drag_resize;
 mod effects;
+mod input_focus;
 mod layout;
+mod overlay_glue;
 mod resize_preview;
+mod workspaces;
 
 use crate::animator::{apply_atomic_window_positions, AnimationEngine};
-use crate::effects::{apply_window_decorations, BorderOverlayWindow, WindowBorderTarget};
-use crate::layout::{compute_workspace_layout, tiled_inner_area, BspNode, SplitAxis};
+use crate::drag_resize::{coalesce_drag_updates, DragSession};
+use crate::effects::{apply_window_decorations, BorderOverlayWindow};
+use crate::input_focus::{force_foreground_window, publish_input_config, spawn_hover_focus_thread};
+use crate::layout::{compute_workspace_layout, BspNode};
 use anyhow::Result;
 use crossbeam_channel::{unbounded, Sender};
 use chickenwm_core::bootstrap_config_and_themes;
-use chickenwm_core::config::{load_or_init_config, HyprConfig, WindowRuleV2};
+use chickenwm_core::config::{load_or_init_config, HyprConfig};
 use chickenwm_core::css::{spawn_config_watcher, ConfigWatchEvent};
-use chickenwm_core::failsafe::{
-    mark_hidden_by_chickenwm, spawn_emergency_failsafe_thread,
-};
+use chickenwm_core::failsafe::spawn_emergency_failsafe_thread;
 use chickenwm_core::frame_scheduler::{AdaptiveFrameScheduler, FramePacerControl};
 use chickenwm_core::handles::SafeHandle;
 use chickenwm_core::init_tracing;
 use chickenwm_core::ipc::{
-    send_ipc_command_to, serve_ipc, Action, BarStateSnapshot, ClientInfo, Direction, IpcCommand,
-    IpcResponse, MonitorInfo, WorkspaceSummary, PIPE_NAME_BAR, PIPE_NAME_WM,
+    serve_ipc, Action, ClientInfo, IpcCommand, IpcResponse, MonitorInfo, PIPE_NAME_WM,
 };
-use chickenwm_core::monitor::{enumerate_monitors, ROOBAR_RESERVED_TOP_PX};
+use chickenwm_core::monitor::enumerate_monitors;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use tracing::info;
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
-use windows::Win32::Graphics::Gdi::UpdateWindow;
 use windows::Win32::System::Threading::{
-    AttachThreadInput, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW,
-    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-    VIRTUAL_KEY, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
-};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, BringWindowToTop, EnumWindows, GetAncestor, GetClassNameW,
-    GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindow, IsWindowVisible, PostMessageW,
-    SendMessageTimeoutW, SetForegroundWindow, ShowWindow, SystemParametersInfoW, WindowFromPoint,
-    ASFW_ANY, SMTO_ABORTIFHUNG, SMTO_NORMAL, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE,
+    DispatchMessageW, EnumWindows, GetClassNameW, GetForegroundWindow, GetWindow,
+    GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
+    IsWindowVisible, MsgWaitForMultipleObjects, PeekMessageW, PostMessageW, PostThreadMessageW,
+    SetCursorPos, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage,
     EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_NAMECHANGE,
-    EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED,
-    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
-    EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, GA_ROOT, GWL_EXSTYLE, GWL_STYLE,
-    SPI_SETFOREGROUNDLOCKTIMEOUT, SW_RESTORE, SW_SHOWNA,
+    EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
+    EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, GWL_EXSTYLE,
+    GWL_STYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOPMOST, MSG, PM_REMOVE, QS_ALLINPUT,
+    SPI_SETFOREGROUNDLOCKTIMEOUT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CLOSE,
-    WS_CAPTION, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_EX_TOOLWINDOW, WS_VISIBLE, DispatchMessageW,
-    MsgWaitForMultipleObjects, PeekMessageW, PostThreadMessageW, TranslateMessage, MSG,
-    PM_REMOVE, QS_ALLINPUT, WM_NULL, GetWindow, SetCursorPos, SetWindowPos, GW_OWNER, HWND_TOPMOST,
-    HWND_NOTOPMOST,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    WM_NULL, WS_CAPTION, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_VISIBLE,
 };
-use std::sync::atomic::{AtomicU32, Ordering};
 
 #[derive(Debug, Clone)]
 pub(crate) enum WmEvent {
@@ -91,6 +84,14 @@ pub(crate) enum WmEvent {
     WinMoveSizeStart(u64),
     WinMoveSizeEnd(u64),
     MouseHover { x: i32, y: i32 },
+    BorderDragStart { x: i32, y: i32 },
+    BorderDragMove {
+        start_x: i32,
+        start_y: i32,
+        curr_x: i32,
+        curr_y: i32,
+    },
+    BorderDragEnd { x: i32, y: i32 },
     DisplayChanged,
     IpcAction(Action),
     ReloadConfig,
@@ -133,142 +134,6 @@ fn pump_messages() {
         while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
-        }
-    }
-}
-
-/// Drops every `MouseDragWindow` that is superseded by a newer one within the same drag.
-/// Drag updates carry absolute cursor positions, so only the latest matters; replaying stale
-/// ones (each a synchronous cross-process resize) is what made drags lag in slow motion.
-fn coalesce_drag_updates(events: Vec<WmEvent>) -> Vec<WmEvent> {
-    let mut keep = vec![true; events.len()];
-    let mut newer_update_pending = false;
-    for (i, ev) in events.iter().enumerate().rev() {
-        if let WmEvent::IpcAction(act) = ev {
-            match act {
-                Action::MouseDragWindow { .. } => {
-                    keep[i] = !newer_update_pending;
-                    newer_update_pending = true;
-                }
-                Action::MouseDragStart { .. } | Action::MouseDragEnd { .. } => {
-                    newer_update_pending = false;
-                }
-                _ => {}
-            }
-        }
-    }
-    events
-        .into_iter()
-        .zip(keep)
-        .filter_map(|(ev, k)| k.then_some(ev))
-        .collect()
-}
-
-/// Reliably transfers system foreground focus to `hwnd` across Win32 thread input queues,
-/// even when triggered asynchronously by mouse hover.
-fn force_foreground_window(hwnd: HWND) {
-    unsafe {
-        if !IsWindow(hwnd).as_bool() {
-            return;
-        }
-        let fg = GetForegroundWindow();
-        if fg == hwnd {
-            return;
-        }
-        let _ = AllowSetForegroundWindow(ASFW_ANY);
-        let fg_tid = GetWindowThreadProcessId(fg, None);
-        let cur_tid = GetCurrentThreadId();
-        let target_tid = GetWindowThreadProcessId(hwnd, None);
-
-        let attached_fg = if fg_tid != 0 && fg_tid != cur_tid {
-            AttachThreadInput(cur_tid, fg_tid, true).as_bool()
-        } else {
-            false
-        };
-        let attached_target = if target_tid != 0 && target_tid != cur_tid && target_tid != fg_tid {
-            AttachThreadInput(cur_tid, target_tid, true).as_bool()
-        } else {
-            false
-        };
-        let attached_fg_target = if fg_tid != 0 && target_tid != 0 && fg_tid != target_tid {
-            AttachThreadInput(fg_tid, target_tid, true).as_bool()
-        } else {
-            false
-        };
-
-        let _ = BringWindowToTop(hwnd);
-        if !SetForegroundWindow(hwnd).as_bool() {
-            // Bypass Windows foreground lock if the OS blocks background focus transition
-            let inputs = [
-                INPUT {
-                    r#type: INPUT_KEYBOARD,
-                    Anonymous: INPUT_0 {
-                        ki: KEYBDINPUT {
-                            wVk: VIRTUAL_KEY(0xFF),
-                            wScan: 0,
-                            dwFlags: Default::default(),
-                            time: 0,
-                            dwExtraInfo: 0,
-                        },
-                    },
-                },
-                INPUT {
-                    r#type: INPUT_KEYBOARD,
-                    Anonymous: INPUT_0 {
-                        ki: KEYBDINPUT {
-                            wVk: VIRTUAL_KEY(0xFF),
-                            wScan: 0,
-                            dwFlags: KEYEVENTF_KEYUP,
-                            time: 0,
-                            dwExtraInfo: 0,
-                        },
-                    },
-                },
-            ];
-            let _ = SendInput(&inputs, size_of::<INPUT>() as i32);
-            let _ = SetForegroundWindow(hwnd);
-        }
-
-        if attached_fg_target {
-            let _ = AttachThreadInput(fg_tid, target_tid, false);
-        }
-        if attached_target {
-            let _ = AttachThreadInput(cur_tid, target_tid, false);
-        }
-        if attached_fg {
-            let _ = AttachThreadInput(cur_tid, fg_tid, false);
-        }
-    }
-}
-
-/// Sends a payload-free sizing notification (`WM_ENTERSIZEMOVE` / `WM_EXITSIZEMOVE`) to each
-/// window, skipping any that don't respond within 100ms so a hung app can't stall the WM.
-fn send_sizing_notification(hwnds: &[u64], msg: u32) {
-    for &h in hwnds {
-        unsafe {
-            let _ = SendMessageTimeoutW(
-                HWND(h as *mut core::ffi::c_void),
-                msg,
-                WPARAM(0),
-                LPARAM(0),
-                SMTO_ABORTIFHUNG | SMTO_NORMAL,
-                100,
-                None,
-            );
-        }
-    }
-}
-
-/// Synchronously delivers pending `WM_PAINT` to each window. Resize messages from another
-/// process are handled before paint, so back-to-back resizes starve repainting (content
-/// trailing at a few FPS); painting between steps gives the same backpressure as a native drag.
-fn paint_now(hwnds: &[u64]) {
-    for &h in hwnds {
-        let hwnd = HWND(h as *mut core::ffi::c_void);
-        unsafe {
-            if !IsHungAppWindow(hwnd).as_bool() {
-                let _ = UpdateWindow(hwnd);
-            }
         }
     }
 }
@@ -417,96 +282,39 @@ fn is_screen_capture_process(process_name: &str) -> bool {
     SCREEN_CAPTURE_PROCESSES.iter().any(|p| p.eq_ignore_ascii_case(process_name))
 }
 
-/// A topmost window ChickenWM doesn't manage (a capture overlay, a game/tool overlay, a picker)
-/// with the cursor over it: focus-follows-mouse must leave it in the foreground. Once the
-/// cursor leaves it (e.g. the bar after a click), hovering a tile focuses that tile again.
-fn is_unmanaged_topmost_at(hwnd: HWND, clients: &HashMap<u64, ClientInfo>, x: i32, y: i32) -> bool {
-    if hwnd.0.is_null() || clients.contains_key(&(hwnd.0 as u64)) {
-        return false;
-    }
-    let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
-    if (ex_style & WS_EX_TOPMOST.0) == 0 {
-        return false;
-    }
-    let mut rc = RECT::default();
-    unsafe { GetWindowRect(hwnd, &mut rc) }.is_ok() && x >= rc.left && x < rc.right && y >= rc.top && y < rc.bottom
-}
-
-/// True for the `chickenwm-launcher` window (matched by the title its viewport sets).
-fn is_launcher_window(hwnd: HWND) -> bool {
-    if hwnd.0.is_null() {
-        return false;
-    }
-    let mut buf = [0u16; 64];
-    let len = unsafe { GetWindowTextW(hwnd, &mut buf) };
-    len > 0 && String::from_utf16_lossy(&buf[..len as usize]) == "ChickenWM Launcher"
-}
-
-/// The visible size the window actually took after a resize. Read from the synchronous window
-/// rect minus the cached shadow margins: `DWMWA_EXTENDED_FRAME_BOUNDS` lags a frame or more
-/// behind, so mid-drag it still reports the previous (larger) size, which made shrinking from a
-/// left/top edge snap back as if the app refused.
-fn visible_frame_size(hwnd: u64) -> Option<(i32, i32)> {
-    let mut rc = RECT::default();
-    unsafe {
-        GetWindowRect(HWND(hwnd as *mut core::ffi::c_void), &mut rc).ok()?;
-    }
-    let [l, t, r, b] = animator::get_dwm_frame_margins(hwnd);
-    Some((rc.right - rc.left - l - r, rc.bottom - rc.top - t - b))
-}
-
-/// Moves one side of the span `[pos, pos + len)` by `delta`: the start side when `edge < 0`,
-/// otherwise the end side. The opposite side stays put and `len` never drops below `min_len`.
-fn resize_span(pos: i32, len: i32, edge: i32, delta: i32, min_len: i32) -> (i32, i32) {
-    if edge < 0 {
-        let new_len = (len - delta).max(min_len);
-        (pos + len - new_len, new_len)
-    } else {
-        (pos, (len + delta).max(min_len))
-    }
-}
-
-/// Snapshot taken when a `Super + LMB/RMB` drag begins. Every drag update is recomputed from
-/// this snapshot plus the total cursor offset, so coalesced or dropped updates never drift.
-struct DragSession {
-    hwnd: u64,
-    /// Drag start point as reported by `chickenwm-binds` (identifies the drag).
-    anchor: (i32, i32),
-    /// Cursor position that `start_rect` / `start_bsp` / `start_mfact` correspond to.
-    origin: (i32, i32),
-    start_rect: [i32; 4],
-    /// Resize edges picked from the grabbed quadrant: -1 = left/top, +1 = right/bottom.
-    edge_x: i32,
-    edge_y: i32,
-    start_bsp: Option<BspNode>,
-    start_mfact: f32,
-}
-
-struct WmState {
-    config: HyprConfig,
-    monitors: Vec<MonitorInfo>,
-    active_workspace: u32,
-    previous_workspace: u32,
-    focused_hwnd: Option<u64>,
-    clients: HashMap<u64, ClientInfo>,
-    workspace_order: HashMap<u32, Vec<u64>>, // workspace_id -> ordered tiled HWNDs
-    workspace_bsp: HashMap<u32, BspNode>,    // workspace_id -> Dwindle BSP tree
+pub(crate) struct WmState {
+    pub(crate) config: HyprConfig,
+    pub(crate) monitors: Vec<MonitorInfo>,
+    pub(crate) active_workspace: u32,
+    pub(crate) previous_workspace: u32,
+    pub(crate) focused_hwnd: Option<u64>,
+    pub(crate) clients: HashMap<u64, ClientInfo>,
+    pub(crate) workspace_order: HashMap<u32, Vec<u64>>, // workspace_id -> ordered tiled HWNDs
+    pub(crate) workspace_bsp: HashMap<u32, BspNode>,    // workspace_id -> Dwindle BSP tree
     /// Windows intentionally hidden by `chickenwm-wm` because they reside on an inactive workspace.
     /// Prevents `EVENT_OBJECT_HIDE` from deleting windows when switching workspaces!
-    wm_hidden_hwnds: HashSet<u64>,
-    /// Window currently being dragged or resized with `Super + LMB/RMB`.
-    drag_target_hwnd: Option<u64>,
+    pub(crate) wm_hidden_hwnds: HashSet<u64>,
+    /// Window currently being dragged or resized with `Super + LMB/RMB` or `resize_on_border`.
+    pub(crate) drag_target_hwnd: Option<u64>,
     /// Visual rectangle of a tiled window while being dragged with `Super + LMB`.
-    drag_visual_rect: Option<[i32; 4]>,
-    drag_session: Option<DragSession>,
+    pub(crate) drag_visual_rect: Option<[i32; 4]>,
+    pub(crate) drag_session: Option<DragSession>,
     /// Windows that were sent `WM_ENTERSIZEMOVE` for the current mouse resize.
-    live_sizing_hwnds: Vec<u64>,
-    animator: AnimationEngine,
+    pub(crate) live_sizing_hwnds: Vec<u64>,
+    pub(crate) animator: AnimationEngine,
+    /// Focus fade: (window losing focus, window gaining it, when).
+    pub(crate) focus_anim: Option<(Option<u64>, Option<u64>, std::time::Instant)>,
+    /// The current mouse drag moves (not resizes) its window.
+    pub(crate) drag_is_move: bool,
+    /// `config.window_rules`, compiled once per config load.
+    pub(crate) rules: Vec<chickenwm_core::window_rules::CompiledRule>,
 }
 
 impl WmState {
     fn new(config: HyprConfig) -> Self {
+        publish_input_config(&config.input, &config.general);
         let monitors = enumerate_monitors();
+        let rules = chickenwm_core::window_rules::compile(&config.window_rules);
         let mut st = Self {
             config,
             monitors,
@@ -522,43 +330,14 @@ impl WmState {
             drag_session: None,
             live_sizing_hwnds: Vec::new(),
             animator: AnimationEngine::new(),
+            focus_anim: None,
+            drag_is_move: false,
+            rules,
         };
         st.scan_existing_windows();
         st.relayout_active_workspace(true);
         st.broadcast_bar_state();
         st
-    }
-
-    fn primary_work_area(&self) -> [i32; 4] {
-        let Some(m) = self
-            .monitors
-            .iter()
-            .find(|m| m.is_primary)
-            .or_else(|| self.monitors.first())
-        else {
-            return [0, ROOBAR_RESERVED_TOP_PX, 1920, 1080 - ROOBAR_RESERVED_TOP_PX];
-        };
-        let mut work = m.work_rect;
-        // Reserve the top strip for `roobar` unless the work area already excludes it (the
-        // daemon reserves it system-wide once explorer's taskbar is gone).
-        let bar_bottom = m.y + ROOBAR_RESERVED_TOP_PX;
-        if work[1] < bar_bottom {
-            let shift = bar_bottom - work[1];
-            work[1] = bar_bottom;
-            work[3] = (work[3] - shift).max(200);
-        }
-        work
-    }
-
-    /// Full bounds of the primary monitor (no bar reservation, no gaps) — what fullscreen
-    /// windows cover.
-    fn primary_monitor_rect(&self) -> [i32; 4] {
-        self.monitors
-            .iter()
-            .find(|m| m.is_primary)
-            .or_else(|| self.monitors.first())
-            .map(|m| [m.x, m.y, m.width, m.height])
-            .unwrap_or([0, 0, 1920, 1080])
     }
 
     /// Games (and video players) that make themselves borderless-fullscreen arrive as a
@@ -577,115 +356,6 @@ impl WmState {
         unsafe {
             let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
-    }
-
-    /// Whether the active workspace currently shows a fullscreen window.
-    fn fullscreen_active(&self) -> bool {
-        self.clients
-            .values()
-            .any(|c| c.workspace_id == self.active_workspace && c.fullscreen)
-    }
-
-    fn virtual_screen_bounds(&self) -> [i32; 4] {
-        if self.monitors.is_empty() {
-            return [0, 0, 1920, 1080];
-        }
-        let min_x = self.monitors.iter().map(|m| m.x).min().unwrap_or(0);
-        let min_y = self.monitors.iter().map(|m| m.y).min().unwrap_or(0);
-        let max_r = self
-            .monitors
-            .iter()
-            .map(|m| m.x + m.width)
-            .max()
-            .unwrap_or(1920);
-        let max_b = self
-            .monitors
-            .iter()
-            .map(|m| m.y + m.height)
-            .max()
-            .unwrap_or(1080);
-        [min_x, min_y, (max_r - min_x).max(100), (max_b - min_y).max(100)]
-    }
-
-    /// Builds a `BarStateSnapshot` for `roobar` synchronization.
-    fn build_bar_snapshot(&self) -> BarStateSnapshot {
-        let mut workspaces = Vec::with_capacity(10);
-        for id in 1..=10 {
-            let mut count = 0usize;
-            let mut focused_title = None;
-            for c in self.clients.values() {
-                if c.workspace_id == id {
-                    count += 1;
-                    if c.focused || focused_title.is_none() {
-                        focused_title = Some(c.title.clone());
-                    }
-                }
-            }
-            workspaces.push(WorkspaceSummary {
-                id,
-                active: id == self.active_workspace,
-                occupied: count > 0,
-                client_count: count,
-                focused_title,
-            });
-        }
-
-        let (active_window_title, active_window_class, active_window_process) = self
-            .focused_hwnd
-            .and_then(|h| self.clients.get(&h))
-            .filter(|c| c.workspace_id == self.active_workspace)
-            .map(|c| (c.title.clone(), c.class.clone(), c.process_name.clone()))
-            .unwrap_or_default();
-
-        let primary_mon = self
-            .monitors
-            .iter()
-            .find(|m| m.is_primary)
-            .or_else(|| self.monitors.first());
-
-        BarStateSnapshot {
-            active_workspace: self.active_workspace,
-            workspaces,
-            active_window_title,
-            active_window_class,
-            active_window_process,
-            active_layout: self.config.general.layout.clone(),
-            monitor_name: primary_mon
-                .map(|m| m.name.clone())
-                .unwrap_or_else(|| r"\\.\DISPLAY1".to_string()),
-            monitor_refresh_hz: primary_mon.map(|m| m.refresh_rate_hz).unwrap_or(60),
-            dwm_hook_active: self.config.misc.dwm_hook_enabled,
-        }
-    }
-
-    /// Directly pushes the latest `BarStateSnapshot` to `roobar` (`\\.\pipe\chickenwm-bar-ipc`)
-    /// so workspace switching and active window indicators update in `<1ms`.
-    fn broadcast_bar_state(&self) {
-        let snapshot = self.build_bar_snapshot();
-        tokio::spawn(async move {
-            let _ = send_ipc_command_to(PIPE_NAME_BAR, &IpcCommand::NotifyBarState(snapshot)).await;
-        });
-    }
-
-    /// Records that the WM hid `hwnd` for an inactive workspace: in memory (so its
-    /// `EVENT_OBJECT_HIDE` isn't treated as the window closing) and as a window property (so the
-    /// failsafe can still restore it if this process is killed first).
-    fn mark_ws_hidden(&mut self, hwnd: u64) {
-        self.wm_hidden_hwnds.insert(hwnd);
-        mark_hidden_by_chickenwm(hwnd);
-    }
-
-    /// Undoes [`Self::mark_ws_hidden`] when the window is shown again or goes away.
-    fn unmark_ws_hidden(&mut self, hwnd: u64) {
-        self.wm_hidden_hwnds.remove(&hwnd);
-        chickenwm_core::failsafe::unpark_window(hwnd);
-    }
-
-    /// Brings back every window parked (or, from older builds, hidden) for an inactive
-    /// workspace, at the position it had before.
-    fn restore_all_hidden_windows(&mut self) {
-        chickenwm_core::failsafe::restore_all_desktop_windows();
-        self.wm_hidden_hwnds.clear();
     }
 
     fn scan_existing_windows(&mut self) {
@@ -736,47 +406,48 @@ impl WmState {
         }
     }
 
-    /// Phase 5.6: Evaluates `windowrulev2` rules against a window (`class`, `title`, `initialClass`).
+    /// Phase 5.6: Applies the `windowrulev2` rules that match a window (see
+    /// `chickenwm_core::window_rules` for matchers and effects).
     fn apply_window_rules(&self, client: &mut ClientInfo) {
+        use chickenwm_core::window_rules::{effects_for, Effect, WindowFacts};
         let mut custom_opacity = None;
-        for rule in &self.config.window_rules {
-            if matches_window_rule(rule, client) {
-                let eff = rule.effect.trim();
-                let eff_lower = eff.to_ascii_lowercase();
-                if eff_lower == "float" || eff_lower == "floating" {
-                    client.floating = true;
-                } else if eff_lower == "tile" {
-                    client.floating = false;
-                } else if eff_lower == "fullscreen" {
-                    client.fullscreen = true;
-                } else if eff_lower == "pseudo" {
-                    client.pseudo = true;
-                } else if eff_lower == "pin" {
-                    client.pinned = true;
-                } else if eff_lower == "center" {
-                    let work = self.primary_work_area();
-                    client.rect[0] = work[0] + (work[2] - client.rect[2]) / 2;
-                    client.rect[1] = work[1] + (work[3] - client.rect[3]) / 2;
-                } else if let Some(ws_str) = eff_lower.strip_prefix("workspace ") {
-                    if let Ok(ws) = ws_str.trim().parse::<u32>() {
-                        client.workspace_id = ws.clamp(1, 10);
+        let facts = WindowFacts { class: &client.class, title: &client.title, process: &client.process_name };
+        let effects: Vec<Effect> = effects_for(&self.rules, &facts).into_iter().cloned().collect();
+        let mut area = self.primary_work_area();
+        for effect in effects {
+            match effect {
+                Effect::Float => client.floating = true,
+                Effect::Tile => client.floating = false,
+                Effect::Fullscreen => client.fullscreen = true,
+                Effect::Pseudo => client.pseudo = true,
+                Effect::Pin => client.pinned = true,
+                Effect::Workspace(ws) => client.workspace_id = ws,
+                Effect::Monitor(name) => {
+                    let found = self.monitors.iter().find(|m| {
+                        m.name.eq_ignore_ascii_case(&name) || name.parse::<usize>().is_ok_and(|i| i == m.id)
+                    });
+                    if let Some(m) = found {
+                        area = m.work_rect;
+                        client.monitor_name = m.name.clone();
+                        client.rect[0] = area[0] + (area[2] - client.rect[2]) / 2;
+                        client.rect[1] = area[1] + (area[3] - client.rect[3]) / 2;
                     }
-                } else if let Some(sz_str) = eff_lower.strip_prefix("size ") {
-                    let mut parts = sz_str.split_whitespace();
-                    if let (Some(Ok(w)), Some(Ok(h))) = (
-                        parts.next().map(|s| s.parse::<i32>()),
-                        parts.next().map(|s| s.parse::<i32>()),
-                    ) {
-                        client.rect[2] = w.max(100);
-                        client.rect[3] = h.max(80);
-                    }
-                } else if let Some(op_str) = eff_lower.strip_prefix("opacity ") {
-                    if let Some(first_op) = op_str.split_whitespace().next() {
-                        if let Ok(op) = first_op.parse::<f32>() {
-                            client.opacity = op.clamp(0.15, 1.0);
-                            custom_opacity = Some(client.opacity);
-                        }
-                    }
+                }
+                Effect::Center => {
+                    client.rect[0] = area[0] + (area[2] - client.rect[2]) / 2;
+                    client.rect[1] = area[1] + (area[3] - client.rect[3]) / 2;
+                }
+                Effect::Size(w, h) => {
+                    client.rect[2] = w;
+                    client.rect[3] = h;
+                }
+                Effect::Move(x, y) => {
+                    client.rect[0] = x;
+                    client.rect[1] = y;
+                }
+                Effect::Opacity(op) => {
+                    client.opacity = op;
+                    custom_opacity = Some(op);
                 }
             }
         }
@@ -844,7 +515,7 @@ impl WmState {
         self.broadcast_bar_state();
     }
 
-    fn remove_window(&mut self, hwnd: u64) {
+    pub(crate) fn remove_window(&mut self, hwnd: u64) {
         self.unmark_ws_hidden(hwnd);
         if let Some(removed) = self.clients.remove(&hwnd) {
             let ws = removed.workspace_id;
@@ -877,29 +548,7 @@ impl WmState {
         }
     }
 
-    fn set_focus(&mut self, new_focus: Option<u64>) {
-        let changed = self.focused_hwnd != new_focus;
-        self.focused_hwnd = new_focus;
-        for (&hwnd, c) in self.clients.iter_mut() {
-            let is_act = Some(hwnd) == new_focus;
-            if c.focused != is_act {
-                c.focused = is_act;
-                apply_window_decorations(
-                    hwnd,
-                    is_act,
-                    c.fullscreen,
-                    None,
-                    &self.config.general,
-                    &self.config.decoration,
-                );
-            }
-        }
-        if changed {
-            self.broadcast_bar_state();
-        }
-    }
-
-    fn relayout_active_workspace(&mut self, _first_boot: bool) {
+    pub(crate) fn relayout_active_workspace(&mut self, _first_boot: bool) {
         self.relayout_active_workspace_with_new(None, 0);
     }
 
@@ -930,7 +579,7 @@ impl WmState {
 
     /// Re-tiles after a Super+drag swap: every tile except the dragged one (`dragged`, which
     /// follows the cursor) animates from where it is now into its new slot.
-    fn relayout_swap_animated(&mut self, dragged: u64) {
+    pub(crate) fn relayout_swap_animated(&mut self, dragged: u64) {
         let ws = self.active_workspace;
         let before: Vec<(u64, [i32; 4])> = self
             .clients
@@ -972,7 +621,7 @@ impl WmState {
         }
     }
 
-    fn relayout_active_workspace_immediate(&mut self, skip_hwnd: Option<u64>) {
+    pub(crate) fn relayout_active_workspace_immediate(&mut self, skip_hwnd: Option<u64>) {
         let ws = self.active_workspace;
         let work_area = self.primary_work_area();
 
@@ -1028,349 +677,7 @@ impl WmState {
         self.animator.apply_immediate_batch(&immediate_batch);
     }
 
-    /// Finds the managed client window on `self.active_workspace` under screen coordinates `(x, y)`.
-    fn find_client_at_point(&self, x: i32, y: i32) -> Option<u64> {
-        let ws = self.active_workspace;
-
-        // 1. Check OS Z-order hit test via `WindowFromPoint` -> `GetAncestor(GA_ROOT)`
-        unsafe {
-            let hit = WindowFromPoint(POINT { x, y });
-            if !hit.0.is_null() {
-                let root = GetAncestor(hit, GA_ROOT);
-                let root_u64 = if !root.0.is_null() {
-                    root.0 as u64
-                } else {
-                    hit.0 as u64
-                };
-                if let Some(c) = self.clients.get(&root_u64) {
-                    if c.workspace_id == ws {
-                        return Some(root_u64);
-                    }
-                }
-            }
-        }
-
-        // 2. Fallback: check floating windows on active workspace first, then tiled windows
-        for c in self.clients.values() {
-            if c.workspace_id == ws && c.floating {
-                let [rx, ry, rw, rh] = c.rect;
-                if x >= rx && x < rx + rw && y >= ry && y < ry + rh {
-                    return Some(c.hwnd);
-                }
-            }
-        }
-        for c in self.clients.values() {
-            if c.workspace_id == ws && !c.floating {
-                let [rx, ry, rw, rh] = c.rect;
-                if x >= rx && x < rx + rw && y >= ry && y < ry + rh {
-                    return Some(c.hwnd);
-                }
-            }
-        }
-        None
-    }
-
-    /// Focus-Follows-Mouse: focuses whichever managed window on the active workspace
-    /// the cursor is hovering over, both in ChickenWM and on the Windows OS.
-    fn handle_mouse_hover(&mut self, x: i32, y: i32) {
-        if self.drag_target_hwnd.is_some() {
-            return;
-        }
-        let fg = unsafe { GetForegroundWindow() };
-        // While the launcher is open it owns the keyboard: moving the mouse over a tile must not
-        // pull focus away from its search box.
-        if is_launcher_window(fg) {
-            return;
-        }
-        // Same for overlays drawn over everything (Snipping Tool's region picker cancels the
-        // capture the moment it loses focus, and selecting a region means moving the mouse).
-        if is_unmanaged_topmost_at(fg, &self.clients, x, y) {
-            return;
-        }
-        if let Some(hovered_hwnd) = self.find_client_at_point(x, y) {
-            let fg_u64 = fg.0 as u64;
-            if self.focused_hwnd != Some(hovered_hwnd) || fg_u64 != hovered_hwnd {
-                self.set_focus(Some(hovered_hwnd));
-                force_foreground_window(HWND(hovered_hwnd as *mut core::ffi::c_void));
-            }
-        }
-    }
-
-    /// Handles the completion of a native Win32 border drag/resize (`EVENT_SYSTEM_MOVESIZEEND`)
-    /// so resizing a window by its border adjusts its tile ratio instead of snapping back.
-    fn handle_native_movesize_end(&mut self, hwnd: u64) {
-        if self.drag_target_hwnd.is_some() {
-            return;
-        }
-        let Some(client) = self.clients.get(&hwnd).cloned() else {
-            return;
-        };
-        if client.workspace_id != self.active_workspace {
-            return;
-        }
-
-        let hwnd_win = HWND(hwnd as *mut core::ffi::c_void);
-        let mut rc = RECT::default();
-        unsafe {
-            if DwmGetWindowAttribute(
-                hwnd_win,
-                DWMWA_EXTENDED_FRAME_BOUNDS,
-                &mut rc as *mut RECT as *mut core::ffi::c_void,
-                size_of::<RECT>() as u32,
-            )
-            .is_err()
-            {
-                let _ = GetWindowRect(hwnd_win, &mut rc);
-            }
-        }
-        let new_rect = [
-            rc.left,
-            rc.top,
-            (rc.right - rc.left).max(100),
-            (rc.bottom - rc.top).max(80),
-        ];
-
-        if client.floating {
-            if let Some(c) = self.clients.get_mut(&hwnd) {
-                c.rect = new_rect;
-            }
-        } else {
-            let dx = new_rect[2] - client.rect[2];
-            let dy = new_rect[3] - client.rect[3];
-            if dx.abs() > 4 || dy.abs() > 4 {
-                self.resize_window_immediate(hwnd, dx, dy);
-            } else {
-                self.relayout_active_workspace_immediate(None);
-            }
-        }
-    }
-
-    /// Resizes `hwnd` (floating or tiled in Dwindle/Master) immediately with 0ms latency.
-    fn resize_window_immediate(&mut self, hwnd: u64, dx: i32, dy: i32) {
-        let is_float = self
-            .clients
-            .get(&hwnd)
-            .map(|c| c.floating)
-            .unwrap_or(false);
-        if is_float {
-            if let Some(c) = self.clients.get_mut(&hwnd) {
-                c.rect[2] = (c.rect[2] + dx).max(100);
-                c.rect[3] = (c.rect[3] + dy).max(80);
-                let r = c.rect;
-                self.animator.apply_immediate_batch(&[(hwnd, r)]);
-            }
-        } else {
-            let work = self.primary_work_area();
-            let rx = (dx as f32) / (work[2].max(1) as f32);
-            let ry = (dy as f32) / (work[3].max(1) as f32);
-            if self.config.general.layout.eq_ignore_ascii_case("master") {
-                if rx.abs() > 0.00001 || ry.abs() > 0.00001 {
-                    let delta = if rx.abs() >= ry.abs() { rx } else { ry };
-                    self.config.master.mfact = (self.config.master.mfact + delta).clamp(0.15, 0.85);
-                    self.relayout_active_workspace_immediate(None);
-                }
-            } else {
-                let adjusted = self
-                    .workspace_bsp
-                    .get_mut(&self.active_workspace)
-                    .map(|tree| tree.adjust_ratio(hwnd, rx, ry))
-                    .unwrap_or(false);
-                if adjusted {
-                    self.relayout_active_workspace_immediate(None);
-                }
-            }
-        }
-    }
-
-    /// Opens (or re-bases) a mouse drag session on `hwnd`. `anchor` is the drag start point
-    /// reported by `chickenwm-binds`; `origin` is the cursor position the snapshot corresponds to.
-    fn begin_drag(&mut self, hwnd: u64, anchor: (i32, i32), origin: (i32, i32)) {
-        let Some(rect) = self.clients.get(&hwnd).map(|c| c.rect) else {
-            self.drag_session = None;
-            return;
-        };
-        let (edge_x, edge_y) = match &self.drag_session {
-            // Keep the grabbed edges stable when re-basing mid-drag.
-            Some(s) if s.hwnd == hwnd && s.anchor == anchor => (s.edge_x, s.edge_y),
-            _ => (
-                if origin.0 < rect[0] + rect[2] / 2 { -1 } else { 1 },
-                if origin.1 < rect[1] + rect[3] / 2 { -1 } else { 1 },
-            ),
-        };
-        self.drag_target_hwnd = Some(hwnd);
-        if self.drag_visual_rect.is_none() {
-            self.drag_visual_rect = Some(rect);
-        }
-        self.drag_session = Some(DragSession {
-            hwnd,
-            anchor,
-            origin,
-            start_rect: rect,
-            edge_x,
-            edge_y,
-            start_bsp: self.workspace_bsp.get(&self.active_workspace).cloned(),
-            start_mfact: self.config.master.mfact,
-        });
-    }
-
-    /// Resizes the drag session's window from the grabbed edges so they track the cursor 1:1,
-    /// then lets every resized window repaint before the next step, like a native border drag.
-    fn apply_drag_resize(&mut self, curr_x: i32, curr_y: i32) {
-        if self.drag_session.is_none() {
-            return;
-        }
-        self.begin_live_sizing();
-        self.apply_drag_resize_geometry(curr_x, curr_y);
-        paint_now(&self.live_sizing_hwnds);
-    }
-
-    /// Puts the windows affected by a mouse resize into the app-side live-resize mode that a
-    /// native border drag uses (`WM_ENTERSIZEMOVE`). Firefox, Chromium/Electron and Windows
-    /// Terminal paint synchronously in this mode instead of trailing behind the new size.
-    fn begin_live_sizing(&mut self) {
-        if !self.live_sizing_hwnds.is_empty() || self.animator.previews.has_active() {
-            return;
-        }
-        let Some(hwnd) = self.drag_session.as_ref().map(|s| s.hwnd) else {
-            return;
-        };
-        let is_float = self.clients.get(&hwnd).map(|c| c.floating).unwrap_or(false);
-        let affected: Vec<u64> = if is_float {
-            vec![hwnd]
-        } else {
-            let ws = self.active_workspace;
-            self.clients
-                .values()
-                .filter(|c| c.workspace_id == ws && !c.floating && !c.fullscreen)
-                .map(|c| c.hwnd)
-                .collect()
-        };
-        // Apps whose renderer can't keep up (misc.resize_preview_classes) get a GPU-stretched
-        // preview for the drag and one real resize on release; everything else resizes live.
-        let mut live = Vec::with_capacity(affected.len());
-        for hwnd in affected {
-            let preview_rect = self
-                .clients
-                .get(&hwnd)
-                .filter(|c| {
-                    self.config
-                        .misc
-                        .resize_preview_classes
-                        .iter()
-                        .any(|class| class.eq_ignore_ascii_case(&c.class))
-                })
-                .map(|c| c.rect);
-            if let Some(rect) = preview_rect {
-                if self.animator.previews.begin(hwnd, rect) {
-                    continue;
-                }
-            }
-            live.push(hwnd);
-        }
-        self.live_sizing_hwnds = live;
-        send_sizing_notification(&self.live_sizing_hwnds, WM_ENTERSIZEMOVE);
-    }
-
-    /// Ends live-resize mode (`WM_EXITSIZEMOVE`) so apps do their final layout pass, and gives
-    /// previewed windows their single real resize into the final layout.
-    fn end_live_sizing(&mut self) {
-        let hwnds = std::mem::take(&mut self.live_sizing_hwnds);
-        send_sizing_notification(&hwnds, WM_EXITSIZEMOVE);
-        let clients = &self.clients;
-        self.animator
-            .previews
-            .commit_all(|hwnd| clients.get(&hwnd).map(|c| c.rect));
-    }
-
-    fn apply_drag_resize_geometry(&mut self, curr_x: i32, curr_y: i32) {
-        let Some(s) = self.drag_session.as_ref() else {
-            return;
-        };
-        let (hwnd, anchor, start_rect, edge_x, edge_y, start_mfact) =
-            (s.hwnd, s.anchor, s.start_rect, s.edge_x, s.edge_y, s.start_mfact);
-        let dx = curr_x - s.origin.0;
-        let dy = curr_y - s.origin.1;
-
-        let is_float = self
-            .clients
-            .get(&hwnd)
-            .map(|c| c.floating)
-            .unwrap_or(false);
-        if is_float {
-            let [x, y, w, h] = start_rect;
-            let (nx, nw) = resize_span(x, w, edge_x, dx, 100);
-            let (ny, nh) = resize_span(y, h, edge_y, dy, 80);
-            let mut r = [nx, ny, nw, nh];
-            self.animator.apply_immediate_batch(&[(hwnd, r)]);
-            // Apps may refuse to shrink below their own minimum size; when they do, the size we
-            // asked for while dragging a left/top edge would push the right/bottom edge instead.
-            // Re-anchor on the opposite edge using the size the window actually took.
-            if let Some((aw, ah)) = visible_frame_size(hwnd) {
-                let mut fixed = r;
-                // 1px slack absorbs DPI rounding in the DWM frame bounds.
-                if edge_x < 0 && aw > nw + 1 {
-                    fixed[0] = x + w - aw;
-                    fixed[2] = aw;
-                }
-                if edge_y < 0 && ah > nh + 1 {
-                    fixed[1] = y + h - ah;
-                    fixed[3] = ah;
-                }
-                if fixed != r {
-                    r = fixed;
-                    self.animator.apply_immediate_batch(&[(hwnd, r)]);
-                }
-            }
-            if let Some(c) = self.clients.get_mut(&hwnd) {
-                c.rect = r;
-            }
-            return;
-        }
-
-        let (inner, gap) = tiled_inner_area(self.primary_work_area(), &self.config.general);
-        if self.config.general.layout.eq_ignore_ascii_case("master") {
-            let (horizontal, sign) = match self.config.master.orientation.as_str() {
-                "right" => (true, -1.0),
-                "top" => (false, 1.0),
-                "bottom" => (false, -1.0),
-                _ => (true, 1.0),
-            };
-            let (delta, extent) = if horizontal { (dx, inner[2]) } else { (dy, inner[3]) };
-            let extent = (extent - gap * 2).max(1) as f32;
-            self.config.master.mfact = (start_mfact + sign * delta as f32 / extent).clamp(0.2, 0.8);
-            self.relayout_active_workspace_immediate(None);
-            return;
-        }
-
-        let ws = self.active_workspace;
-        let snapshot = self.drag_session.as_ref().and_then(|s| s.start_bsp.clone());
-        let Some(mut tree) = snapshot else {
-            return;
-        };
-        let unchanged = self
-            .workspace_bsp
-            .get(&ws)
-            .map(|cur| cur.same_shape(&tree))
-            .unwrap_or(false);
-        if !unchanged {
-            // A window opened/closed or a split toggled mid-drag: re-snapshot from here.
-            self.begin_drag(hwnd, anchor, (curr_x, curr_y));
-            return;
-        }
-        for (axis, edge, delta) in [
-            (SplitAxis::Horizontal, edge_x, dx),
-            (SplitAxis::Vertical, edge_y, dy),
-        ] {
-            if !tree.resize_edge(hwnd, axis, edge, delta, inner, gap) {
-                // Window touches the screen edge on this side: drag the opposite boundary instead.
-                tree.resize_edge(hwnd, axis, -edge, delta, inner, gap);
-            }
-        }
-        self.workspace_bsp.insert(ws, tree);
-        self.relayout_active_workspace_immediate(None);
-    }
-
-    fn relayout_active_workspace_with_new(
+    pub(crate) fn relayout_active_workspace_with_new(
         &mut self,
         new_win: Option<(u64, [i32; 4])>,
         workspace_slide_dir: i32,
@@ -1483,125 +790,6 @@ impl WmState {
         if !pre_position.is_empty() {
             apply_atomic_window_positions(&pre_position, false);
         }
-    }
-
-    /// How far workspaces slide: a full screen width (a carousel: the old workspace leaves as
-    /// the new one arrives) on a single monitor; a short slide when other monitors would show
-    /// windows passing through.
-    fn workspace_slide_distance(&self) -> i32 {
-        let work = self.primary_work_area();
-        if self.monitors.len() <= 1 {
-            work[2] + self.config.general.gaps_out.max(0) * 2
-        } else {
-            work[2] / 5
-        }
-    }
-
-    fn switch_workspace(&mut self, target_ws: u32) {
-        let target_ws = target_ws.clamp(1, 10);
-        if target_ws == self.active_workspace {
-            self.broadcast_bar_state();
-            return;
-        }
-        self.drag_target_hwnd = None;
-        self.drag_visual_rect = None;
-        self.drag_session = None;
-        self.end_live_sizing();
-
-        let old_ws = self.active_workspace;
-        self.previous_workspace = old_ws;
-        self.active_workspace = target_ws;
-        for m in &mut self.monitors {
-            m.active_workspace_id = target_ws;
-        }
-
-        // Prune any windows that closed while on an inactive workspace
-        let dead_hwnds: Vec<u64> = self
-            .clients
-            .keys()
-            .copied()
-            .filter(|&h| !unsafe { IsWindow(HWND(h as *mut core::ffi::c_void)).as_bool() })
-            .collect();
-        for dh in dead_hwnds {
-            self.remove_window(dh);
-        }
-
-        let slide_dir = if target_ws > old_ws { 1 } else { -1 };
-        let full_slide = self.monitors.len() <= 1;
-        let distance = self.workspace_slide_distance();
-
-        let to_show: Vec<u64> = self
-            .clients
-            .values()
-            .filter(|c| c.workspace_id == target_ws && !c.pinned)
-            .map(|c| c.hwnd)
-            .collect();
-        for &hwnd_u64 in &to_show {
-            self.unmark_ws_hidden(hwnd_u64);
-        }
-
-        // 1. Old workspace: slide out the opposite way and hide at the end (carousel), or hide
-        //    right away when a full-width slide would cross another monitor. Windows are marked
-        //    in `wm_hidden_hwnds` BEFORE hiding so the resulting `EVENT_OBJECT_HIDE` doesn't
-        //    drop them from `self.clients`.
-        let to_hide: Vec<(u64, [i32; 4])> = self
-            .clients
-            .values()
-            .filter(|c| c.workspace_id == old_ws && !c.pinned)
-            .map(|c| (c.hwnd, c.rect))
-            .collect();
-        for (hwnd_u64, rect) in to_hide {
-            self.mark_ws_hidden(hwnd_u64);
-            if full_slide {
-                let out = [rect[0] - slide_dir * distance, rect[1], rect[2], rect[3]];
-                self.animator.animate_workspace(hwnd_u64, rect, out, true, &self.config);
-            } else {
-                self.animator.remove_window(hwnd_u64);
-                chickenwm_core::failsafe::park_window(hwnd_u64);
-            }
-        }
-
-        // 2. New workspace: lay out (this parks each window at its slide start), then show.
-        self.relayout_active_workspace_with_new(None, slide_dir);
-        for hwnd_u64 in to_show {
-            let hwnd = HWND(hwnd_u64 as *mut core::ffi::c_void);
-            unsafe {
-                if IsIconic(hwnd).as_bool() {
-                    let _ = ShowWindow(hwnd, SW_RESTORE);
-                } else {
-                    let _ = ShowWindow(hwnd, SW_SHOWNA);
-                }
-            }
-        }
-
-        // 3. Focus window under mouse cursor on target_ws if available, otherwise top window
-        let mut pt = POINT::default();
-        let hover_focus = if unsafe { GetCursorPos(&mut pt).is_ok() } {
-            self.find_client_at_point(pt.x, pt.y)
-        } else {
-            None
-        };
-        let next_focus = hover_focus
-            .or_else(|| {
-                self.workspace_order
-                    .get(&target_ws)
-                    .and_then(|v| v.last().copied())
-            })
-            .or_else(|| {
-                self.clients
-                    .values()
-                    .find(|c| c.workspace_id == target_ws)
-                    .map(|c| c.hwnd)
-            });
-        self.set_focus(next_focus);
-        if let Some(fh) = next_focus {
-            force_foreground_window(HWND(fh as *mut core::ffi::c_void));
-        }
-
-
-        // 5. Immediately synchronize workspace indicator with `roobar`
-        info!("Switched workspace {} -> {}", old_ws, target_ws);
-        self.broadcast_bar_state();
     }
 
     fn handle_action(&mut self, action: Action) {
@@ -1761,18 +949,8 @@ impl WmState {
                     }
                 }
             }
-            Action::MouseDragStart { is_resize: _, x, y } => {
-                let target = self.find_client_at_point(x, y).or(self.focused_hwnd);
-                if let Some(hwnd) = target {
-                    if self.focused_hwnd != Some(hwnd) {
-                        self.set_focus(Some(hwnd));
-                    }
-                    force_foreground_window(HWND(hwnd as *mut core::ffi::c_void));
-                    self.end_live_sizing();
-                    self.drag_session = None;
-                    self.drag_visual_rect = None;
-                    self.begin_drag(hwnd, (x, y), (x, y));
-                }
+            Action::MouseDragStart { is_resize, x, y } => {
+                self.handle_mouse_drag_start(is_resize, x, y);
             }
             Action::MouseDragWindow {
                 is_resize,
@@ -1781,135 +959,10 @@ impl WmState {
                 curr_x,
                 curr_y,
             } => {
-                // `start_*` is the fixed drag anchor; `curr_*` the latest cursor position.
-                let anchor = (start_x, start_y);
-                // Only apply updates belonging to the active drag. chickenwm-binds always sends
-                // MouseDragStart first; an update without a matching session is a straggler that
-                // raced past MouseDragEnd. Opening a session from it would re-apply the whole
-                // previous drag on top of the already-resized layout (the "jump").
-                if self.drag_session.as_ref().map(|s| s.anchor) != Some(anchor) {
-                    return;
-                }
-                let Some((hwnd, origin, start_rect)) = self
-                    .drag_session
-                    .as_ref()
-                    .map(|s| (s.hwnd, s.origin, s.start_rect))
-                else {
-                    return;
-                };
-                if self.focused_hwnd != Some(hwnd) {
-                    self.set_focus(Some(hwnd));
-                }
-                let dx = curr_x - origin.0;
-                let dy = curr_y - origin.1;
-
-                if is_resize {
-                    self.apply_drag_resize(curr_x, curr_y);
-                } else {
-                    let is_float = self
-                        .clients
-                        .get(&hwnd)
-                        .map(|c| c.floating)
-                        .unwrap_or(false);
-                    if is_float {
-                        if let Some(c) = self.clients.get_mut(&hwnd) {
-                            c.rect[0] = start_rect[0] + dx;
-                            c.rect[1] = start_rect[1] + dy;
-                            let r = c.rect;
-                            self.animator.apply_immediate_batch(&[(hwnd, r)]);
-                        }
-                    } else {
-                        // Tiled window Super + Left Click & Drag:
-                        // 1. Move the dragged window 1:1 with the mouse cursor immediately
-                        let mut vr = self.drag_visual_rect.unwrap_or(start_rect);
-                        vr[0] = start_rect[0] + dx;
-                        vr[1] = start_rect[1] + dy;
-                        self.drag_visual_rect = Some(vr);
-                        self.animator.apply_immediate_batch(&[(hwnd, vr)]);
-
-                        // 2. Check if the cursor crossed into another tiled window's slot on this workspace
-                        let ws = self.active_workspace;
-                        let target_swap = self
-                            .clients
-                            .values()
-                            .find(|c| {
-                                c.workspace_id == ws
-                                    && !c.floating
-                                    && !c.fullscreen
-                                    && c.hwnd != hwnd
-                                    && curr_x >= c.rect[0]
-                                    && curr_x < c.rect[0] + c.rect[2]
-                                    && curr_y >= c.rect[1]
-                                    && curr_y < c.rect[1] + c.rect[3]
-                            })
-                            .map(|c| c.hwnd);
-
-                        if let Some(other_hwnd) = target_swap {
-                            if let Some(list) = self.workspace_order.get_mut(&ws) {
-                                let pos_a = list.iter().position(|&h| h == hwnd);
-                                let pos_b = list.iter().position(|&h| h == other_hwnd);
-                                if let (Some(ia), Some(ib)) = (pos_a, pos_b) {
-                                    list.swap(ia, ib);
-                                }
-                            }
-                            if let Some(tree) = self.workspace_bsp.get_mut(&ws) {
-                                tree.swap_leaves(hwnd, other_hwnd);
-                            }
-                            // Glide the other tiled windows into their swapped slots (ease in-out)
-                            // while keeping `hwnd` attached to the cursor.
-                            self.relayout_swap_animated(hwnd);
-                            // Resize the dragged window's visual rect to match its new target slot size
-                            if let Some(new_slot) = self.clients.get(&hwnd).map(|c| c.rect) {
-                                vr[2] = new_slot[2];
-                                vr[3] = new_slot[3];
-                                self.drag_visual_rect = Some(vr);
-                                self.animator.apply_immediate_batch(&[(hwnd, vr)]);
-                            }
-                        }
-                    }
-                }
+                self.handle_mouse_drag_window(is_resize, start_x, start_y, curr_x, curr_y);
             }
             Action::MouseDragEnd { is_resize, x, y } => {
-                // The last cursor position may have been coalesced away on release; apply it now.
-                if is_resize {
-                    self.apply_drag_resize(x, y);
-                } else if let Some((hwnd, origin, r)) = self
-                    .drag_session
-                    .as_ref()
-                    .map(|s| (s.hwnd, s.origin, s.start_rect))
-                {
-                    if let Some(c) = self.clients.get_mut(&hwnd).filter(|c| c.floating) {
-                        c.rect[0] = r[0] + x - origin.0;
-                        c.rect[1] = r[1] + y - origin.1;
-                        let rect = c.rect;
-                        self.animator.apply_immediate_batch(&[(hwnd, rect)]);
-                    }
-                }
-                self.end_live_sizing();
-                let dragged = self.drag_target_hwnd.take();
-                let visual_rc = self.drag_visual_rect.take();
-                self.drag_session = None;
-                if !is_resize {
-                    if let Some(hwnd) = dragged {
-                        let is_tiled = self
-                            .clients
-                            .get(&hwnd)
-                            .map(|c| !c.floating && !c.fullscreen)
-                            .unwrap_or(false);
-                        if is_tiled {
-                            if let Some(target_rect) = self.clients.get(&hwnd).map(|c| c.rect) {
-                                let from_rect = visual_rc.unwrap_or(target_rect);
-                                self.animator.animate_window(
-                                    hwnd,
-                                    from_rect,
-                                    target_rect,
-                                    false,
-                                    &self.config,
-                                );
-                            }
-                        }
-                    }
-                }
+                self.handle_mouse_drag_end(is_resize, x, y);
             }
             Action::FocusWindow(hwnd) => {
                 if let Some(ws) = self.clients.get(&hwnd).map(|c| c.workspace_id) {
@@ -1935,159 +988,6 @@ impl WmState {
             _ => {}
         }
     }
-
-    fn move_active_to_workspace(&mut self, target_ws: u32, follow: bool) {
-        let target_ws = target_ws.clamp(1, 10);
-        let Some(hwnd) = self.focused_hwnd else {
-            return;
-        };
-        let old_ws = self.active_workspace;
-        if target_ws == old_ws {
-            return;
-        }
-
-        let is_float = self
-            .clients
-            .get(&hwnd)
-            .map(|c| c.floating)
-            .unwrap_or(false);
-
-        if let Some(c) = self.clients.get_mut(&hwnd) {
-            c.workspace_id = target_ws;
-        }
-        if let Some(list) = self.workspace_order.get_mut(&old_ws) {
-            list.retain(|&h| h != hwnd);
-        }
-        if let Some(tree) = self.workspace_bsp.remove(&old_ws) {
-            if let Some(nt) = tree.remove(hwnd) {
-                self.workspace_bsp.insert(old_ws, nt);
-            }
-        }
-
-        if !is_float {
-            let list = self.workspace_order.entry(target_ws).or_default();
-            if !list.contains(&hwnd) {
-                list.push(hwnd);
-            }
-            let work = self.primary_work_area();
-            let d_cfg = self.config.dwindle.clone();
-            self.workspace_bsp
-                .entry(target_ws)
-                .and_modify(|t| {
-                    t.insert(None, hwnd, work, &d_cfg);
-                })
-                .or_insert_with(|| BspNode::Leaf(hwnd));
-        }
-
-        if follow {
-            self.switch_workspace(target_ws);
-        } else {
-            self.mark_ws_hidden(hwnd);
-            self.animator.remove_window(hwnd);
-            chickenwm_core::failsafe::park_window(hwnd);
-            let next_focus = self
-                .workspace_order
-                .get(&old_ws)
-                .and_then(|v| v.last().copied())
-                .or_else(|| {
-                    self.clients
-                        .values()
-                        .find(|c| c.workspace_id == old_ws)
-                        .map(|c| c.hwnd)
-                });
-            self.set_focus(next_focus);
-            if let Some(fh) = next_focus {
-                force_foreground_window(HWND(fh as *mut core::ffi::c_void));
-            }
-            self.relayout_active_workspace(false);
-            self.broadcast_bar_state();
-        }
-    }
-
-    fn find_neighbor(&self, from_hwnd: u64, dir: Direction) -> Option<u64> {
-        let cur = self.clients.get(&from_hwnd)?;
-        let cx = cur.rect[0] + cur.rect[2] / 2;
-        let cy = cur.rect[1] + cur.rect[3] / 2;
-
-        let mut best: Option<(i64, u64)> = None;
-        for (&hwnd, c) in &self.clients {
-            if hwnd == from_hwnd || c.workspace_id != self.active_workspace {
-                continue;
-            }
-            let nx = c.rect[0] + c.rect[2] / 2;
-            let ny = c.rect[1] + c.rect[3] / 2;
-            let dx = (nx - cx) as i64;
-            let dy = (ny - cy) as i64;
-
-            let valid = match dir {
-                Direction::Left => dx < -10,
-                Direction::Right => dx > 10,
-                Direction::Up => dy < -10,
-                Direction::Down => dy > 10,
-            };
-            if valid {
-                let dist = dx * dx + dy * dy;
-                if best.map(|(b_dist, _)| dist < b_dist).unwrap_or(true) {
-                    best = Some((dist, hwnd));
-                }
-            }
-        }
-        best.map(|(_, h)| h)
-    }
-
-    fn border_targets(&self, anim_overrides: &[(u64, [i32; 4])]) -> Vec<WindowBorderTarget> {
-        let mut out = Vec::new();
-        for (&hwnd, c) in &self.clients {
-            if c.workspace_id != self.active_workspace || c.fullscreen {
-                continue;
-            }
-            let rect = if self.drag_target_hwnd == Some(hwnd) {
-                self.drag_visual_rect.unwrap_or(c.rect)
-            } else {
-                anim_overrides
-                    .iter()
-                    .find(|&&(h, _)| h == hwnd)
-                    .map(|&(_, r)| r)
-                    .unwrap_or(c.rect)
-            };
-            out.push(WindowBorderTarget {
-                hwnd,
-                rect,
-                is_active: Some(hwnd) == self.focused_hwnd,
-            });
-        }
-        out
-    }
-}
-
-fn matches_window_rule(rule: &WindowRuleV2, client: &ClientInfo) -> bool {
-    let m = rule.matcher.trim();
-    if let Some(pat) = m
-        .strip_prefix("class:")
-        .or_else(|| m.strip_prefix("initialClass:"))
-    {
-        let clean = pat
-            .trim()
-            .trim_start_matches('^')
-            .trim_end_matches('$')
-            .trim_matches(|c| c == '(' || c == ')');
-        return client
-            .class
-            .to_ascii_lowercase()
-            .contains(&clean.to_ascii_lowercase());
-    }
-    if let Some(pat) = m.strip_prefix("title:") {
-        let clean = pat
-            .trim()
-            .trim_start_matches('^')
-            .trim_end_matches('$')
-            .trim_matches(|c| c == '(' || c == ')');
-        return client
-            .title
-            .to_ascii_lowercase()
-            .contains(&clean.to_ascii_lowercase());
-    }
-    false
 }
 
 /// Phase 5.1: Enumerates and filters top-level windows (`EnumWindows`), filtering out invisible windows,
@@ -2341,31 +1241,8 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Spawn Focus-Follows-Mouse cursor tracker thread (~125 Hz when mouse moves, zero overhead when stationary)
-    thread::Builder::new()
-        .name("chickenwm-wm-hover-focus".to_string())
-        .spawn(move || {
-            let mut last_pt = POINT { x: -99999, y: -99999 };
-            loop {
-                thread::sleep(std::time::Duration::from_millis(8));
-                let mut pt = POINT::default();
-                unsafe {
-                    if GetCursorPos(&mut pt).is_ok() {
-                        if pt.x != last_pt.x || pt.y != last_pt.y {
-                            last_pt = pt;
-                            // Do not steal focus while any mouse button is held down (text selection, dragging, etc.)
-                            // or while hovering over the top roobar region
-                            let lmb = (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0;
-                            let rmb = (GetAsyncKeyState(VK_RBUTTON.0 as i32) as u16 & 0x8000) != 0;
-                            let mmb = (GetAsyncKeyState(VK_MBUTTON.0 as i32) as u16 & 0x8000) != 0;
-                            if !lmb && !rmb && !mmb && pt.y > ROOBAR_RESERVED_TOP_PX {
-                                send_wm_event(WmEvent::MouseHover { x: pt.x, y: pt.y });
-                            }
-                        }
-                    }
-                }
-            }
-        })?;
+    // Spawn Focus-Follows-Mouse & `resize_on_border` cursor tracker thread (~125 Hz when mouse moves)
+    spawn_hover_focus_thread()?;
 
     // Spawn Win32 WinEventHook thread (Phase 5.2)
     thread::Builder::new()
@@ -2458,6 +1335,16 @@ async fn main() -> Result<()> {
                             let mut st = wm.lock();
                             st.config.misc.dwm_hook_enabled = dwm_hook_enabled;
                             st.broadcast_bar_state();
+                        }
+                        if dwm_hook_enabled {
+                            if let Ok(mut dll) = std::env::current_exe() {
+                                dll.set_file_name("chickenwm_dwm_hook.dll");
+                                if dll.exists() {
+                                    let _ = chickenwm_dwm_hook::inject_into_dwm(&dll);
+                                }
+                            }
+                        } else {
+                            let _ = chickenwm_dwm_hook::eject_from_dwm();
                         }
                         pacer.wake();
                         IpcResponse::Ok {
@@ -2595,6 +1482,20 @@ async fn main() -> Result<()> {
                     WmEvent::MouseHover { x, y } => {
                         st.handle_mouse_hover(x, y);
                     }
+                    WmEvent::BorderDragStart { x, y } => {
+                        st.try_begin_border_drag(x, y);
+                    }
+                    WmEvent::BorderDragMove {
+                        start_x,
+                        start_y,
+                        curr_x,
+                        curr_y,
+                    } => {
+                        st.handle_border_drag_move(start_x, start_y, curr_x, curr_y);
+                    }
+                    WmEvent::BorderDragEnd { x, y } => {
+                        st.handle_border_drag_end(x, y);
+                    }
                     WmEvent::DisplayChanged => {
                         st.monitors = enumerate_monitors();
                         pacer_loop.refresh_monitors();
@@ -2612,6 +1513,8 @@ async fn main() -> Result<()> {
                                 Some(new_cfg.misc.fps_limit)
                             });
                             pacer_loop.set_vfr(new_cfg.misc.vfr);
+                            publish_input_config(&new_cfg.input, &new_cfg.general);
+                            st.rules = chickenwm_core::window_rules::compile(&new_cfg.window_rules);
                             st.config = new_cfg;
                             st.relayout_active_workspace(false);
                             st.broadcast_bar_state();
@@ -2626,6 +1529,23 @@ async fn main() -> Result<()> {
             // that isn't managed yet gets adopted.
             if last_sweep.elapsed() >= std::time::Duration::from_millis(1500) {
                 last_sweep = std::time::Instant::now();
+                let hook_enabled = wm_loop.lock().config.misc.dwm_hook_enabled;
+                if hook_enabled {
+                    for telem in chickenwm_dwm_hook::poll_dwm_telemetry() {
+                        if telem.hwnd != 0 {
+                            let mut st = wm_loop.lock();
+                            match telem.kind {
+                                chickenwm_dwm_hook::DwmEventKind::WindowCreated => {
+                                    st.add_or_show_window(telem.hwnd);
+                                }
+                                chickenwm_dwm_hook::DwmEventKind::WindowDestroyed => {
+                                    st.remove_window(telem.hwnd);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
                 let found = discover_manageable_windows();
                 let mut st = wm_loop.lock();
                 // Apps (and some toolkits on resize/show) put their native frame back; strip it
@@ -2652,7 +1572,7 @@ async fn main() -> Result<()> {
 
             let has_active_anims = {
                 let st = wm_loop.lock();
-                st.animator.has_active_animations() || st.drag_target_hwnd.is_some()
+                st.animator.has_active_animations() || st.drag_target_hwnd.is_some() || st.focus_fading()
             };
             let dt = if has_active_anims {
                 scheduler.wait_for_next_frame(true)
@@ -2665,7 +1585,7 @@ async fn main() -> Result<()> {
                 scheduler.sample_delta_seconds()
             };
 
-            let (targets, general, decoration, dwm_hook, fullscreen) = {
+            let (targets, general, decoration, dwm_hook, fullscreen, drop_preview) = {
                 let mut st = wm_loop.lock();
                 let current_rects = st.animator.tick(dt);
                 let bt = st.border_targets(&current_rects);
@@ -2675,6 +1595,7 @@ async fn main() -> Result<()> {
                     st.config.decoration.clone(),
                     st.config.misc.dwm_hook_enabled,
                     st.fullscreen_active(),
+                    st.drop_preview(),
                 )
             };
 
@@ -2684,7 +1605,7 @@ async fn main() -> Result<()> {
                 // latency — so the overlay steps aside while something is fullscreen.
                 overlay.set_hidden(fullscreen);
                 if !fullscreen {
-                    overlay.render_frame(dt, &targets, &general, &decoration, dwm_hook);
+                    overlay.render_frame(dt, &targets, &general, &decoration, dwm_hook, drop_preview);
                 }
             }
         }

@@ -2,7 +2,7 @@
 //! Titlebar Stripping, Rounded Corners, and Click-Through Animated Gradient Border Overlay.
 
 use chickenwm_core::config::{BorderColorSpec, DecorationConfig, GeneralConfig, RgbaColor};
-use chickenwm_dwm_hook::{update_dwm_visual_transform, DwmVisualTransform};
+use chickenwm_dwm_hook::DwmVisualTransform;
 use std::mem::size_of;
 use std::time::{Duration, Instant};
 use windows::core::PCWSTR;
@@ -27,38 +27,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_CAPTION, WS_THICKFRAME, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_POPUP,
 };
-
-/// WGSL shader source for hardware-accelerated SDF rounded-rectangle animated gradient borders.
-pub const BORDER_SHADER_WGSL: &str = r#"
-struct BorderUniforms {
-    rect: vec4<f32>,          // x, y, width, height
-    color_primary: vec4<f32>,
-    color_secondary: vec4<f32>,
-    params: vec4<f32>,        // radius, border_width, angle_rad, time
-};
-
-@group(0) @binding(0)
-var<uniform> u: BorderUniforms;
-
-fn sd_rounded_box(p: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
-    let q = abs(p) - b + vec2<f32>(r, r);
-    return min(max(q.x, q.y), 0.0) + length(max(q, vec2<f32>(0.0, 0.0))) - r;
-}
-
-@fragment
-fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
-    let center = u.rect.xy + u.rect.zw * 0.5;
-    let half_size = u.rect.zw * 0.5;
-    let p = frag_coord.xy - center;
-    let dist = sd_rounded_box(p, half_size, u.params.x);
-    let bw = u.params.y;
-    let alpha_sdf = 1.0 - smoothstep(-bw, 1.0, abs(dist + bw * 0.5) - bw * 0.5);
-    let dir = vec2<f32>(cos(u.params.z + u.params.w), sin(u.params.z + u.params.w));
-    let t = clamp(dot(normalize(p + vec2<f32>(0.001, 0.001)), dir) * 0.5 + 0.5, 0.0, 1.0);
-    let col = mix(u.color_primary, u.color_secondary, t);
-    return vec4<f32>(col.rgb, col.a * alpha_sdf);
-}
-"#;
 
 /// Phase 5.1: Force-disables native Windows DWM transitions (`DWMWA_TRANSITIONS_FORCEDISABLED`)
 /// on a managed window so native animations never conflict with ChickenWM's cubic-bezier engine.
@@ -195,6 +163,8 @@ pub struct WindowBorderTarget {
     pub hwnd: u64,
     pub rect: [i32; 4], // [x, y, width, height]
     pub is_active: bool,
+    /// 0 = inactive look, 1 = active look; in between while focus moves (a short fade).
+    pub focus_t: f32,
 }
 
 /// Phase 5.5: Click-through (`WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE`)
@@ -207,7 +177,9 @@ pub struct BorderOverlayWindow {
     /// Canvas-space `[x0, y0, x1, y1]` boxes painted last frame; only these get cleared.
     prev_dirty: Vec<[i32; 4]>,
     /// What was presented last frame, so unchanged frames skip all rendering work.
-    last_frame: Vec<([i32; 4], bool)>,
+    last_frame: Vec<([i32; 4], bool, u8)>,
+    /// The drop preview presented last frame.
+    last_preview: Option<[i32; 4]>,
     last_phase: f32,
     presented_once: bool,
     last_topmost: Option<Instant>,
@@ -347,6 +319,7 @@ impl BorderOverlayWindow {
                 surface: None,
                 prev_dirty: Vec::new(),
                 last_frame: Vec::new(),
+                last_preview: None,
                 last_phase: 0.0,
                 presented_once: false,
                 last_topmost: None,
@@ -384,13 +357,16 @@ impl BorderOverlayWindow {
         general: &GeneralConfig,
         decoration: &DecorationConfig,
         dwm_hook_enabled: bool,
+        // Where a dragged tile will land: drawn as a soft highlight.
+        drop_preview: Option<[i32; 4]>,
     ) {
         self.phase_rad =
             (self.phase_rad + dt * decoration.border_anim_speed * 2.2) % std::f32::consts::TAU;
 
         // If Experimental DWM Hook Mode is enabled, stream transforms directly to the in-process DWM hook
-        // and clear the external overlay window to eliminate overlay latency (Phase 1.1 & 5.5).
+        // over `\\.\pipe\dwm_ipc` (`chickenwm-dwm-hook`).
         if dwm_hook_enabled {
+            let mut batch = Vec::with_capacity(targets.len());
             for t in targets {
                 let spec = if t.is_active {
                     &general.col_active_border
@@ -402,12 +378,12 @@ impl BorderOverlayWindow {
                     .secondary
                     .unwrap_or(spec.primary)
                     .to_normalized_f32();
-                update_dwm_visual_transform(DwmVisualTransform {
+                batch.push(DwmVisualTransform {
                     hwnd: t.hwnd,
                     scale_x: 1.0,
                     scale_y: 1.0,
-                    translate_x: 0.0,
-                    translate_y: 0.0,
+                    translate_x: t.rect[0] as f32,
+                    translate_y: t.rect[1] as f32,
                     opacity: if t.is_active {
                         decoration.active_opacity
                     } else {
@@ -420,8 +396,7 @@ impl BorderOverlayWindow {
                     border_width: general.border_size as f32,
                 });
             }
-            // No `return`: the transforms above only live in this process (nothing carries them
-            // into dwm.exe), so in hook mode the overlay below is still what draws the borders.
+            let _ = chickenwm_dwm_hook::update_dwm_visual_transforms_batch(&batch);
         }
 
         if general.border_size <= 0 {
@@ -437,8 +412,8 @@ impl BorderOverlayWindow {
         let animated = decoration.border_anim_speed != 0.0
             && general.col_active_border.secondary.is_some();
         let phase = if animated { self.phase_rad } else { 0.0 };
-        let frame: Vec<([i32; 4], bool)> = targets.iter().map(|t| (t.rect, t.is_active)).collect();
-        if self.presented_once && frame == self.last_frame && phase == self.last_phase {
+        let frame: Vec<([i32; 4], bool, u8)> = targets.iter().map(|t| (t.rect, t.is_active, (t.focus_t.clamp(0.0, 1.0) * 32.0) as u8)).collect();
+        if self.presented_once && frame == self.last_frame && phase == self.last_phase && drop_preview == self.last_preview {
             return;
         }
 
@@ -460,12 +435,27 @@ impl BorderOverlayWindow {
             }
         }
 
-        let mut new_dirty = Vec::with_capacity(targets.len());
+        let mut new_dirty = Vec::with_capacity(targets.len() + 1);
+        if let Some(p) = drop_preview {
+            let rect = [p[0] - self.bounds[0], p[1] - self.bounds[1], p[2], p[3]];
+            let accent = general.col_active_border.primary;
+            draw_drop_preview(pixels, width, height, rect, radius, accent);
+            let dirty = [rect[0].clamp(0, width), rect[1].clamp(0, height), (rect[0] + rect[2]).clamp(0, width), (rect[1] + rect[3]).clamp(0, height)];
+            if dirty[0] < dirty[2] && dirty[1] < dirty[3] {
+                new_dirty.push(dirty);
+            }
+        }
         for target in targets {
-            let spec = if target.is_active {
+            // Mid-fade: colours between the inactive and active borders.
+            let t = target.focus_t.clamp(0.0, 1.0);
+            let blended;
+            let spec = if t >= 0.999 {
                 &general.col_active_border
-            } else {
+            } else if t <= 0.001 {
                 &general.col_inactive_border
+            } else {
+                blended = blend_spec(&general.col_inactive_border, &general.col_active_border, t);
+                &blended
             };
             // Fully transparent border (e.g. `col.inactive_border = rgba(00000000)`): nothing
             // to draw, and skipping it keeps the dirty region down to visible borders.
@@ -486,7 +476,7 @@ impl BorderOverlayWindow {
                 bw,
                 radius,
                 spec,
-                if target.is_active { phase } else { 0.0 },
+                if target.focus_t > 0.5 { phase * target.focus_t } else { 0.0 },
             );
             let pad = bw + 1;
             let dirty = [
@@ -530,6 +520,7 @@ impl BorderOverlayWindow {
 
         self.prev_dirty = new_dirty;
         self.last_frame = frame;
+        self.last_preview = drop_preview;
         self.last_phase = phase;
         if let Some(rc) = dirty_rect {
             self.present_layered_dib(width, height, &rc);
@@ -683,4 +674,46 @@ fn lerp_premultiplied_argb(c1: RgbaColor, c2: RgbaColor, t: f32, aa: f32) -> u32
     let pb = (b * alpha_norm).round() as u32;
     let pa = a.round() as u32;
     (pa << 24) | (pr << 16) | (pg << 8) | pb
+}
+
+fn lerp_color(a: RgbaColor, b: RgbaColor, t: f32) -> RgbaColor {
+    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    RgbaColor { r: l(a.r, b.r), g: l(a.g, b.g), b: l(a.b, b.b), a: l(a.a, b.a) }
+}
+
+/// A border spec part-way from `from` to `to` (focus fades).
+fn blend_spec(from: &BorderColorSpec, to: &BorderColorSpec, t: f32) -> BorderColorSpec {
+    let from2 = from.secondary.unwrap_or(from.primary);
+    let to2 = to.secondary.unwrap_or(to.primary);
+    BorderColorSpec {
+        primary: lerp_color(from.primary, to.primary, t),
+        secondary: (from.secondary.is_some() || to.secondary.is_some()).then(|| lerp_color(from2, to2, t)),
+        angle_deg: to.angle_deg,
+    }
+}
+
+/// The slot a dragged tile will land in: a faint fill with a slightly stronger outline.
+fn draw_drop_preview(buf: &mut [u32], canvas_w: i32, canvas_h: i32, rect: [i32; 4], radius: i32, accent: RgbaColor) {
+    let [rx, ry, rw, rh] = rect;
+    if rw <= 20 || rh <= 20 {
+        return;
+    }
+    let fill = RgbaColor { a: 38, ..accent };
+    let edge = RgbaColor { a: 150, ..accent };
+    let (x0, y0, x1, y1) = (rx.max(0), ry.max(0), (rx + rw).min(canvas_w), (ry + rh).min(canvas_h));
+    let r = radius.min(rw / 2).min(rh / 2) as f32;
+    let (cx, cy, hw, hh) = (rx as f32 + rw as f32 * 0.5, ry as f32 + rh as f32 * 0.5, rw as f32 * 0.5, rh as f32 * 0.5);
+    for y in y0..y1 {
+        let qy = (y as f32 + 0.5 - cy).abs() - hh + r;
+        for x in x0..x1 {
+            let qx = (x as f32 + 0.5 - cx).abs() - hw + r;
+            let sdf = qx.max(qy).min(0.0) + (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() - r;
+            if sdf > 0.5 {
+                continue;
+            }
+            let aa = (0.5 - sdf).clamp(0.0, 1.0);
+            let c = if sdf > -2.5 { edge } else { fill };
+            buf[(y * canvas_w + x) as usize] = lerp_premultiplied_argb(c, c, 0.0, aa);
+        }
+    }
 }
