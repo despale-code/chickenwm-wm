@@ -5,6 +5,24 @@
 
 use crate::effects::WindowBorderTarget;
 use crate::WmState;
+use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+
+/// The window's visible frame on screen right now (`[x, y, w, h]`, without the invisible
+/// resize margins), as DWM draws it.
+fn visible_frame_rect(hwnd: u64) -> Option<[i32; 4]> {
+    let mut rc = RECT::default();
+    unsafe {
+        DwmGetWindowAttribute(
+            HWND(hwnd as *mut core::ffi::c_void),
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut rc as *mut RECT as *mut core::ffi::c_void,
+            std::mem::size_of::<RECT>() as u32,
+        )
+        .ok()?;
+    }
+    (rc.right > rc.left && rc.bottom > rc.top).then(|| [rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top])
+}
 
 impl WmState {
     pub(crate) fn border_targets(&self, anim_overrides: &[(u64, [i32; 4])]) -> Vec<WindowBorderTarget> {
@@ -13,8 +31,12 @@ impl WmState {
             if c.workspace_id != self.active_workspace || c.fullscreen {
                 continue;
             }
-            let rect = if self.drag_target_hwnd == Some(hwnd) {
+            // A mouse *move* draws the window where it is dragged; a resize changes `c.rect`
+            // as it goes (the drag rect stays at where the resize started).
+            let rect = if self.drag_target_hwnd == Some(hwnd) && self.drag_is_move {
                 self.drag_visual_rect.unwrap_or(c.rect)
+            } else if self.native_movesize == Some(hwnd) {
+                visible_frame_rect(hwnd).unwrap_or(c.rect)
             } else {
                 anim_overrides
                     .iter()

@@ -3,6 +3,7 @@
 
 use chickenwm_core::config::{BorderColorSpec, DecorationConfig, GeneralConfig, RgbaColor};
 use chickenwm_dwm_hook::DwmVisualTransform;
+use std::collections::HashMap;
 use std::mem::size_of;
 use std::time::{Duration, Instant};
 use windows::core::PCWSTR;
@@ -174,13 +175,12 @@ pub struct BorderOverlayWindow {
     bounds: [i32; 4], // [x, y, width, height] virtual screen bounds
     phase_rad: f32,
     surface: Option<LayeredSurface>,
-    /// Canvas-space `[x0, y0, x1, y1]` boxes painted last frame; only these get cleared.
-    prev_dirty: Vec<[i32; 4]>,
-    /// What was presented last frame, so unchanged frames skip all rendering work.
-    last_frame: Vec<([i32; 4], bool, u8)>,
+    /// Per window: how its border was last painted and the canvas strips it covers.
+    painted: HashMap<u64, (BorderKey, Vec<[i32; 4]>)>,
+    /// Border colours, width and rounding last painted with.
+    last_style: String,
     /// The drop preview presented last frame.
     last_preview: Option<[i32; 4]>,
-    last_phase: f32,
     presented_once: bool,
     last_topmost: Option<Instant>,
     /// Hidden while a window is fullscreen (see `set_hidden`).
@@ -317,10 +317,9 @@ impl BorderOverlayWindow {
                 bounds: virtual_bounds,
                 phase_rad: 0.0,
                 surface: None,
-                prev_dirty: Vec::new(),
-                last_frame: Vec::new(),
+                painted: HashMap::new(),
+                last_style: String::new(),
                 last_preview: None,
-                last_phase: 0.0,
                 presented_once: false,
                 last_topmost: None,
                 hidden: false,
@@ -344,7 +343,7 @@ impl BorderOverlayWindow {
         }
         if !hidden {
             self.presented_once = false;
-            self.last_frame.clear();
+            self.painted.clear();
         }
     }
 
@@ -408,42 +407,81 @@ impl BorderOverlayWindow {
         let width = self.bounds[2].max(100);
         let height = self.bounds[3].max(100);
 
-        // Skip the frame entirely when nothing visible changed (static borders, idle windows).
         let animated = decoration.border_anim_speed != 0.0
             && general.col_active_border.secondary.is_some();
         let phase = if animated { self.phase_rad } else { 0.0 };
-        let frame: Vec<([i32; 4], bool, u8)> = targets.iter().map(|t| (t.rect, t.is_active, (t.focus_t.clamp(0.0, 1.0) * 32.0) as u8)).collect();
-        if self.presented_once && frame == self.last_frame && phase == self.last_phase && drop_preview == self.last_preview {
-            return;
-        }
 
         if self.surface.as_ref().map(|s| (s.width, s.height)) != Some((width, height)) {
             self.surface = LayeredSurface::new(width, height);
-            self.prev_dirty.clear();
             self.presented_once = false;
         }
+        // A config change (colours, width, rounding) repaints everything.
+        let style = format!(
+            "{:?}{:?}{bw}{radius}",
+            general.col_active_border, general.col_inactive_border
+        );
+        let full = !self.presented_once || style != self.last_style;
+        let canvas = |r: [i32; 4]| [r[0] - self.bounds[0], r[1] - self.bounds[1], r[2], r[3]];
+
+        // Which windows' borders changed since the last frame. Only their old and new border
+        // strips are cleared and re-sent to DWM; a static window costs nothing. (Sending the
+        // union of every border's bounding box meant re-uploading most of the screen each
+        // frame of any move, resize or animation.)
+        let mut present: Vec<[i32; 4]> = Vec::new();
+        let mut painted = HashMap::with_capacity(targets.len());
+        for t in targets {
+            let fade = (t.focus_t.clamp(0.0, 1.0) * 32.0) as u8;
+            let key = BorderKey {
+                rect: t.rect,
+                fade,
+                phase_bits: if t.focus_t > 0.5 { (phase * t.focus_t).to_bits() } else { 0 },
+            };
+            let strips = ring_strips(canvas(t.rect), bw, radius, width, height);
+            let old = self.painted.remove(&t.hwnd);
+            if full || old.as_ref().is_none_or(|(k, _)| *k != key) {
+                if let Some((_, old_strips)) = &old {
+                    present.extend_from_slice(old_strips);
+                }
+                present.extend_from_slice(&strips);
+            }
+            painted.insert(t.hwnd, (key, strips));
+        }
+        // Windows that are gone (closed, other workspace, fullscreen): erase their borders.
+        for (_, (_, old_strips)) in self.painted.drain() {
+            present.extend_from_slice(&old_strips);
+        }
+        self.painted = painted;
+        if full || drop_preview != self.last_preview {
+            for p in [self.last_preview, drop_preview].into_iter().flatten() {
+                let r = canvas(p);
+                present.push(clamp_box([r[0], r[1], r[0] + r[2], r[1] + r[3]], width, height));
+            }
+        }
+        present.retain(|r| r[0] < r[2] && r[1] < r[3]);
+        if !full && present.is_empty() {
+            return;
+        }
+
         let Some(surface) = self.surface.as_mut() else {
             return;
         };
         let pixels = surface.pixels();
-
-        // Erase only what was painted last frame.
-        for &[x0, y0, x1, y1] in &self.prev_dirty {
-            for y in y0..y1 {
-                let row = (y * width) as usize;
-                pixels[row + x0 as usize..row + x1 as usize].fill(0);
+        if full {
+            pixels.fill(0);
+        } else {
+            for &[x0, y0, x1, y1] in &present {
+                for y in y0..y1 {
+                    let row = (y * width) as usize;
+                    pixels[row + x0 as usize..row + x1 as usize].fill(0);
+                }
             }
         }
 
-        let mut new_dirty = Vec::with_capacity(targets.len() + 1);
+        // Redraw everything (ring pixels only, cheap); only the cleared areas are presented, so
+        // borders of static windows that overlapped them come back exactly as they were.
         if let Some(p) = drop_preview {
-            let rect = [p[0] - self.bounds[0], p[1] - self.bounds[1], p[2], p[3]];
             let accent = general.col_active_border.primary;
-            draw_drop_preview(pixels, width, height, rect, radius, accent);
-            let dirty = [rect[0].clamp(0, width), rect[1].clamp(0, height), (rect[0] + rect[2]).clamp(0, width), (rect[1] + rect[3]).clamp(0, height)];
-            if dirty[0] < dirty[2] && dirty[1] < dirty[3] {
-                new_dirty.push(dirty);
-            }
+            draw_drop_preview(pixels, width, height, canvas(p), radius, accent);
         }
         for target in targets {
             // Mid-fade: colours between the inactive and active borders.
@@ -462,73 +500,48 @@ impl BorderOverlayWindow {
             if spec.primary.a == 0 && spec.secondary.is_none_or(|c| c.a == 0) {
                 continue;
             }
-            let rect = [
-                target.rect[0] - self.bounds[0],
-                target.rect[1] - self.bounds[1],
-                target.rect[2],
-                target.rect[3],
-            ];
             draw_rounded_gradient_border(
                 pixels,
                 width,
                 height,
-                rect,
+                canvas(target.rect),
                 bw,
                 radius,
                 spec,
                 if target.focus_t > 0.5 { phase * target.focus_t } else { 0.0 },
             );
-            let pad = bw + 1;
-            let dirty = [
-                (rect[0] - pad).clamp(0, width),
-                (rect[1] - pad).clamp(0, height),
-                (rect[0] + rect[2] + pad).clamp(0, width),
-                (rect[1] + rect[3] + pad).clamp(0, height),
-            ];
-            if dirty[0] < dirty[2] && dirty[1] < dirty[3] {
-                new_dirty.push(dirty);
-            }
         }
 
-        // Present only the union of last frame's and this frame's border boxes.
-        let union = self
-            .prev_dirty
-            .iter()
-            .chain(new_dirty.iter())
-            .fold(None, |acc: Option<[i32; 4]>, r| {
-                Some(match acc {
-                    None => *r,
-                    Some(a) => [a[0].min(r[0]), a[1].min(r[1]), a[2].max(r[2]), a[3].max(r[3])],
-                })
-            });
-        let dirty_rect = if self.presented_once {
-            union.map(|u| RECT {
-                left: u[0],
-                top: u[1],
-                right: u[2],
-                bottom: u[3],
-            })
-        } else {
-            // First present must cover the whole window.
-            Some(RECT {
-                left: 0,
-                top: 0,
-                right: width,
-                bottom: height,
-            })
-        };
-
-        self.prev_dirty = new_dirty;
-        self.last_frame = frame;
         self.last_preview = drop_preview;
-        self.last_phase = phase;
-        if let Some(rc) = dirty_rect {
-            self.present_layered_dib(width, height, &rc);
-            self.presented_once = true;
+        self.last_style = style;
+        if full {
+            self.present_layered_dib(width, height, &RECT { left: 0, top: 0, right: width, bottom: height });
+        } else if present.len() > MAX_DIRTY_PRESENTS {
+            // Very many small updates: one covering box is cheaper than that many calls.
+            let u = present.iter().fold(present[0], |a, r| [a[0].min(r[0]), a[1].min(r[1]), a[2].max(r[2]), a[3].max(r[3])]);
+            self.present_layered_dib(width, height, &RECT { left: u[0], top: u[1], right: u[2], bottom: u[3] });
+        } else {
+            for r in &present {
+                self.present_layered_dib(width, height, &RECT { left: r[0], top: r[1], right: r[2], bottom: r[3] });
+            }
+        }
+        self.presented_once = true;
+        self.keep_topmost();
+    }
+
+    /// Re-asserting topmost is a z-order recalculation; a few times per second is plenty.
+    fn keep_topmost(&mut self) {
+        if self.last_topmost.is_some_and(|t| t.elapsed() < Duration::from_millis(250)) {
+            return;
+        }
+        self.last_topmost = Some(Instant::now());
+        unsafe {
+            let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
     }
 
-    fn present_layered_dib(&mut self, width: i32, height: i32, dirty: &RECT) {
+    /// Copies `dirty` of the surface to the layered window (only that area is transferred).
+    fn present_layered_dib(&self, width: i32, height: i32, dirty: &RECT) {
         let Some(surface) = self.surface.as_ref() else {
             return;
         };
@@ -561,25 +574,46 @@ impl BorderOverlayWindow {
                 prcDirty: dirty,
             };
             let _ = UpdateLayeredWindowIndirect(self.hwnd, &info);
-
-            // Re-asserting topmost is a z-order recalculation; a few times per second is plenty.
-            let due = self
-                .last_topmost
-                .map_or(true, |t| t.elapsed() >= Duration::from_millis(250));
-            if due {
-                self.last_topmost = Some(Instant::now());
-                let _ = SetWindowPos(
-                    self.hwnd,
-                    HWND_TOPMOST,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                );
-            }
         }
     }
+}
+
+/// Above this many dirty strips in a frame, they are sent as one covering box instead.
+const MAX_DIRTY_PRESENTS: usize = 48;
+
+/// What a window's border looked like when it was last painted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BorderKey {
+    rect: [i32; 4],
+    /// Focus-fade step (0..=32).
+    fade: u8,
+    /// Gradient rotation, for animated borders.
+    phase_bits: u32,
+}
+
+fn clamp_box(b: [i32; 4], width: i32, height: i32) -> [i32; 4] {
+    [b[0].clamp(0, width), b[1].clamp(0, height), b[2].clamp(0, width), b[3].clamp(0, height)]
+}
+
+/// The canvas boxes `[x0, y0, x1, y1]` a border around `rect` can paint, as four thin strips
+/// (top and bottom include the rounded corners) instead of the whole bounding box.
+fn ring_strips(rect: [i32; 4], bw: i32, radius: i32, width: i32, height: i32) -> Vec<[i32; 4]> {
+    let [x, y, w, h] = rect;
+    if w <= 20 || h <= 20 {
+        return Vec::new();
+    }
+    let pad = bw + 1;
+    let corner = (radius + bw + 1).min(h / 2);
+    [
+        [x - pad, y - pad, x + w + pad, y + corner],
+        [x - pad, y + h - corner, x + w + pad, y + h + pad],
+        [x - pad, y + corner, x + pad, y + h - corner],
+        [x + w - pad, y + corner, x + w + pad, y + h - corner],
+    ]
+    .into_iter()
+    .map(|b| clamp_box(b, width, height))
+    .filter(|b| b[0] < b[2] && b[1] < b[3])
+    .collect()
 }
 
 /// Fast scanline ring rasterizer for rounded gradient borders (`col.active_border = rgba(...) rgba(...) 45deg`).
@@ -714,6 +748,46 @@ fn draw_drop_preview(buf: &mut [u32], canvas_w: i32, canvas_h: i32, rect: [i32; 
             let aa = (0.5 - sdf).clamp(0.0, 1.0);
             let c = if sdf > -2.5 { edge } else { fill };
             buf[(y * canvas_w + x) as usize] = lerp_premultiplied_argb(c, c, 0.0, aa);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every pixel a border paints must lie inside its strips, or moving the window would
+    /// leave pieces of the old border behind.
+    #[test]
+    fn ring_strips_cover_every_painted_pixel() {
+        let (w, h) = (400, 300);
+        let spec = BorderColorSpec {
+            primary: RgbaColor { r: 255, g: 0, b: 0, a: 255 },
+            secondary: Some(RgbaColor { r: 0, g: 0, b: 255, a: 255 }),
+            angle_deg: 45.0,
+        };
+        for &(rect, bw, radius) in &[
+            ([50, 40, 200, 150], 2, 10),
+            ([10, 10, 120, 60], 4, 0),
+            ([0, 0, 400, 300], 3, 16),
+            ([30, 30, 60, 30], 1, 32),
+        ] {
+            let mut buf = vec![0u32; (w * h) as usize];
+            draw_rounded_gradient_border(&mut buf, w, h, rect, bw, radius, &spec, 0.0);
+            let strips = ring_strips(rect, bw, radius, w, h);
+            let mut painted = 0;
+            for y in 0..h {
+                for x in 0..w {
+                    if buf[(y * w + x) as usize] != 0 {
+                        painted += 1;
+                        assert!(
+                            strips.iter().any(|s| x >= s[0] && x < s[2] && y >= s[1] && y < s[3]),
+                            "pixel ({x}, {y}) of {rect:?} bw {bw} r {radius} is outside {strips:?}"
+                        );
+                    }
+                }
+            }
+            assert!(painted > 0);
         }
     }
 }

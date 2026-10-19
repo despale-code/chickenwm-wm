@@ -312,6 +312,9 @@ pub(crate) struct WmState {
     pub(crate) last_hover_hwnd: Option<u64>,
     /// Windows adopted in the last few seconds; they may not take focus on their own.
     pub(crate) fresh_windows: HashMap<u64, std::time::Instant>,
+    /// Window in Windows' own move/size loop (title bar or edge drag); its border follows the
+    /// real window every frame.
+    pub(crate) native_movesize: Option<u64>,
 }
 
 impl WmState {
@@ -339,6 +342,7 @@ impl WmState {
             rules,
             last_hover_hwnd: None,
             fresh_windows: HashMap::new(),
+            native_movesize: None,
         };
         st.scan_existing_windows();
         st.relayout_active_workspace(true);
@@ -1501,8 +1505,10 @@ async fn main() -> Result<()> {
                     }
                     WmEvent::WinMoveSizeStart(h) => {
                         st.animator.remove_window(h);
+                        st.native_movesize = Some(h);
                     }
                     WmEvent::WinMoveSizeEnd(h) => {
+                        st.native_movesize = None;
                         st.handle_native_movesize_end(h);
                     }
                     WmEvent::MouseHover { x, y } => {
@@ -1598,7 +1604,10 @@ async fn main() -> Result<()> {
 
             let has_active_anims = {
                 let st = wm_loop.lock();
-                st.animator.has_active_animations() || st.drag_target_hwnd.is_some() || st.focus_fading()
+                st.animator.has_active_animations()
+                    || st.drag_target_hwnd.is_some()
+                    || st.native_movesize.is_some()
+                    || st.focus_fading()
             };
             let dt = if has_active_anims {
                 scheduler.wait_for_next_frame(true)
