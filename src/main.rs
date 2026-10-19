@@ -659,7 +659,7 @@ impl WmState {
                 c.rect = screen;
             }
             if Some(fs_hwnd) != skip_hwnd {
-                self.animator.apply_immediate_batch(&[(fs_hwnd, screen)]);
+                self.animator.apply_immediate_batch(&[(fs_hwnd, screen)], false);
             }
             return;
         }
@@ -698,7 +698,7 @@ impl WmState {
                 immediate_batch.push((hwnd, target_rect));
             }
         }
-        self.animator.apply_immediate_batch(&immediate_batch);
+        self.animator.apply_immediate_batch(&immediate_batch, false);
     }
 
     pub(crate) fn relayout_active_workspace_with_new(
@@ -968,7 +968,7 @@ impl WmState {
                             c.rect[0] += dx;
                             c.rect[1] += dy;
                             let r = c.rect;
-                            self.animator.apply_immediate_batch(&[(hwnd, r)]);
+                            self.animator.apply_immediate_batch(&[(hwnd, r)], true);
                         }
                     }
                 }

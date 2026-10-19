@@ -147,7 +147,7 @@ impl AnimationEngine {
     /// Cancels any active animation for these windows and applies their new positions immediately (0ms latency).
     /// Used during live interactive mouse move/resize so windows never lag or rubber-band behind the cursor.
     /// Windows with an active resize preview only move their preview; the real resize happens on release.
-    pub fn apply_immediate_batch(&mut self, positions: &[(u64, [i32; 4])]) {
+    pub fn apply_immediate_batch(&mut self, positions: &[(u64, [i32; 4])], move_only: bool) {
         let mut direct = Vec::with_capacity(positions.len());
         for &(hwnd, rect) in positions {
             self.active.remove(&hwnd);
@@ -155,7 +155,7 @@ impl AnimationEngine {
                 direct.push((hwnd, rect));
             }
         }
-        apply_atomic_window_positions(&direct, false);
+        apply_atomic_window_positions(&direct, move_only);
     }
 
     /// Starts or retargets a smooth cubic-bezier animation for `hwnd` toward `target_rect`.
@@ -448,34 +448,39 @@ pub fn apply_atomic_window_positions(positions: &[(u64, [i32; 4])], move_only: b
     // SWP_NOSENDCHANGING skips WM_WINDOWPOSCHANGING, which is where apps (Discord and other
     // Electron/Chromium apps especially) and DefWindowProc clamp to their minimum track size.
     // Without it a tile narrower than the app's minimum would overflow into its neighbours.
+    // SWP_ASYNCWINDOWPOS ensures the calling thread never halts waiting for a foreign app's UI thread.
     let mut flags = SWP_NOZORDER
         | SWP_NOACTIVATE
-        | SWP_NOCOPYBITS
         | SWP_NOOWNERZORDER
-        | SWP_NOSENDCHANGING;
+        | SWP_NOSENDCHANGING
+        | SWP_ASYNCWINDOWPOS;
     if move_only {
         flags |= SWP_NOSIZE;
+    } else {
+        flags |= SWP_NOCOPYBITS;
     }
 
     unsafe {
-        if let Ok(mut hdwp) = BeginDeferWindowPos(positions.len() as i32) {
-            let mut deferred_ok = true;
-            for &(hwnd_u64, visible_rect) in positions {
-                let [x, y, w, h] = compensate_dwm_frame_bounds(hwnd_u64, visible_rect);
-                let hwnd = HWND(hwnd_u64 as *mut core::ffi::c_void);
-                match DeferWindowPos(hdwp, hwnd, None, x, y, w.max(50), h.max(40), flags) {
-                    Ok(new_hdwp) if !new_hdwp.is_invalid() => {
-                        hdwp = new_hdwp;
-                    }
-                    _ => {
-                        deferred_ok = false;
-                        break;
+        if positions.len() > 1 {
+            if let Ok(mut hdwp) = BeginDeferWindowPos(positions.len() as i32) {
+                let mut deferred_ok = true;
+                for &(hwnd_u64, visible_rect) in positions {
+                    let [x, y, w, h] = compensate_dwm_frame_bounds(hwnd_u64, visible_rect);
+                    let hwnd = HWND(hwnd_u64 as *mut core::ffi::c_void);
+                    match DeferWindowPos(hdwp, hwnd, None, x, y, w.max(50), h.max(40), flags) {
+                        Ok(new_hdwp) if !new_hdwp.is_invalid() => {
+                            hdwp = new_hdwp;
+                        }
+                        _ => {
+                            deferred_ok = false;
+                            break;
+                        }
                     }
                 }
-            }
-            if deferred_ok {
-                let _ = EndDeferWindowPos(hdwp);
-                return;
+                if deferred_ok {
+                    let _ = EndDeferWindowPos(hdwp);
+                    return;
+                }
             }
         }
 

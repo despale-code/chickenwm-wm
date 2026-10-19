@@ -13,9 +13,8 @@ use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
-use windows::Win32::Graphics::Gdi::UpdateWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowRect, IsHungAppWindow, SendMessageTimeoutW, SMTO_ABORTIFHUNG, SMTO_NORMAL,
+    GetWindowRect, SendMessageTimeoutW, SMTO_ABORTIFHUNG, SMTO_NORMAL,
     WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE,
 };
 
@@ -90,17 +89,7 @@ pub(crate) fn send_sizing_notification(hwnds: &[u64], msg: u32) {
     }
 }
 
-/// Synchronously delivers pending `WM_PAINT` to each window.
-pub(crate) fn paint_now(hwnds: &[u64]) {
-    for &h in hwnds {
-        let hwnd = HWND(h as *mut core::ffi::c_void);
-        unsafe {
-            if !IsHungAppWindow(hwnd).as_bool() {
-                let _ = UpdateWindow(hwnd);
-            }
-        }
-    }
-}
+
 
 /// The visible size the window actually took after a resize.
 pub(crate) fn visible_frame_size(hwnd: u64) -> Option<(i32, i32)> {
@@ -251,7 +240,7 @@ impl WmState {
                 c.rect[2] = (c.rect[2] + dx).max(100);
                 c.rect[3] = (c.rect[3] + dy).max(80);
                 let r = c.rect;
-                self.animator.apply_immediate_batch(&[(hwnd, r)]);
+                self.animator.apply_immediate_batch(&[(hwnd, r)], false);
             }
         } else {
             let work = self.primary_work_area();
@@ -323,7 +312,6 @@ impl WmState {
         }
         self.begin_live_sizing();
         self.apply_drag_resize_geometry(curr_x, curr_y);
-        paint_now(&self.live_sizing_hwnds);
     }
 
     /// Puts the windows affected by a mouse resize into the app-side live-resize mode that a
@@ -406,7 +394,7 @@ impl WmState {
             let (nx, nw) = resize_span(x, w, edge_x, dx, 100);
             let (ny, nh) = resize_span(y, h, edge_y, dy, 80);
             let mut r = [nx, ny, nw, nh];
-            self.animator.apply_immediate_batch(&[(hwnd, r)]);
+            self.animator.apply_immediate_batch(&[(hwnd, r)], false);
             if let Some((aw, ah)) = visible_frame_size(hwnd) {
                 let mut fixed = r;
                 if edge_x < 0 && aw > nw + 1 {
@@ -419,7 +407,7 @@ impl WmState {
                 }
                 if fixed != r {
                     r = fixed;
-                    self.animator.apply_immediate_batch(&[(hwnd, r)]);
+                    self.animator.apply_immediate_batch(&[(hwnd, r)], false);
                 }
             }
             if let Some(c) = self.clients.get_mut(&hwnd) {
@@ -527,14 +515,14 @@ impl WmState {
                     c.rect[0] = start_rect[0] + dx;
                     c.rect[1] = start_rect[1] + dy;
                     let r = c.rect;
-                    self.animator.apply_immediate_batch(&[(hwnd, r)]);
+                    self.animator.apply_immediate_batch(&[(hwnd, r)], true);
                 }
             } else {
                 let mut vr = self.drag_visual_rect.unwrap_or(start_rect);
                 vr[0] = start_rect[0] + dx;
                 vr[1] = start_rect[1] + dy;
                 self.drag_visual_rect = Some(vr);
-                self.animator.apply_immediate_batch(&[(hwnd, vr)]);
+                self.animator.apply_immediate_batch(&[(hwnd, vr)], true);
 
                 let ws = self.active_workspace;
                 let target_swap = self
@@ -568,7 +556,7 @@ impl WmState {
                         vr[2] = new_slot[2];
                         vr[3] = new_slot[3];
                         self.drag_visual_rect = Some(vr);
-                        self.animator.apply_immediate_batch(&[(hwnd, vr)]);
+                        self.animator.apply_immediate_batch(&[(hwnd, vr)], false);
                     }
                 }
             }
@@ -587,7 +575,7 @@ impl WmState {
                 c.rect[0] = r[0] + x - origin.0;
                 c.rect[1] = r[1] + y - origin.1;
                 let rect = c.rect;
-                self.animator.apply_immediate_batch(&[(hwnd, rect)]);
+                self.animator.apply_immediate_batch(&[(hwnd, rect)], true);
             }
         }
         self.end_live_sizing();
