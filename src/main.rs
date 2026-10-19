@@ -308,6 +308,10 @@ pub(crate) struct WmState {
     pub(crate) drag_is_move: bool,
     /// `config.window_rules`, compiled once per config load.
     pub(crate) rules: Vec<chickenwm_core::window_rules::CompiledRule>,
+    /// The managed window the cursor was last seen over (focus-follows-mouse acts on entering).
+    pub(crate) last_hover_hwnd: Option<u64>,
+    /// Windows adopted in the last few seconds; they may not take focus on their own.
+    pub(crate) fresh_windows: HashMap<u64, std::time::Instant>,
 }
 
 impl WmState {
@@ -333,6 +337,8 @@ impl WmState {
             focus_anim: None,
             drag_is_move: false,
             rules,
+            last_hover_hwnd: None,
+            fresh_windows: HashMap::new(),
         };
         st.scan_existing_windows();
         st.relayout_active_workspace(true);
@@ -487,6 +493,10 @@ impl WmState {
         let ws = info.workspace_id;
         let is_float = info.floating;
         let initial_rect = info.rect;
+        // Decided before the window is added: a new window only gets focus when nothing else
+        // has it, or when it belongs to the focused app (its dialogs, its second window).
+        let take_focus = self.new_window_may_take_focus(hwnd);
+        self.mark_fresh(hwnd);
         self.clients.insert(hwnd, info);
 
         if !is_float {
@@ -506,17 +516,26 @@ impl WmState {
         }
 
         if ws == self.active_workspace {
-            self.set_focus(Some(hwnd));
+            if take_focus {
+                self.set_focus(Some(hwnd));
+            } else {
+                self.keep_focus_from(hwnd);
+            }
             self.relayout_active_workspace_with_new(Some((hwnd, initial_rect)), 0);
         } else {
             self.mark_ws_hidden(hwnd);
             chickenwm_core::failsafe::park_window(hwnd);
+            self.keep_focus_from(hwnd);
         }
         self.broadcast_bar_state();
     }
 
     pub(crate) fn remove_window(&mut self, hwnd: u64) {
         self.unmark_ws_hidden(hwnd);
+        self.fresh_windows.remove(&hwnd);
+        if self.last_hover_hwnd == Some(hwnd) {
+            self.last_hover_hwnd = None;
+        }
         if let Some(removed) = self.clients.remove(&hwnd) {
             let ws = removed.workspace_id;
             if let Some(list) = self.workspace_order.get_mut(&ws) {
@@ -1459,7 +1478,14 @@ async fn main() -> Result<()> {
                         }
                     }
                     WmEvent::WinFocused(h) => {
-                        if let Some(ws) = st.clients.get(&h).map(|c| c.workspace_id) {
+                        if st.is_fresh(h)
+                            && !crate::input_focus::user_is_activating(h)
+                            && !st.new_window_may_take_focus(h)
+                        {
+                            // A just-opened window grabbed the foreground by itself (apps do on
+                            // launch): give it back, and never follow it to another workspace.
+                            st.keep_focus_from(h);
+                        } else if let Some(ws) = st.clients.get(&h).map(|c| c.workspace_id) {
                             if ws == st.active_workspace {
                                 st.set_focus(Some(h));
                             } else if st.wm_hidden_hwnds.contains(&h) {
