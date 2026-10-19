@@ -156,6 +156,9 @@ impl AnimationEngine {
             }
         }
         apply_atomic_window_positions(&direct, false);
+        for &(hwnd, _) in &direct {
+            let _ = chickenwm_core::sys::attach_in_place_hit_test(HWND(hwnd as *mut _));
+        }
     }
 
     /// Starts or retargets a smooth cubic-bezier animation for `hwnd` toward `target_rect`.
@@ -182,7 +185,7 @@ impl AnimationEngine {
             self.hide_on_finish.remove(&hwnd);
             apply_atomic_window_positions(&[(hwnd, target_rect)], false);
             if hide_after {
-                chickenwm_core::failsafe::park_window(hwnd);
+                let _ = chickenwm_core::sys::set_window_cloak(HWND(hwnd as *mut _), true);
             }
             return;
         }
@@ -205,6 +208,11 @@ impl AnimationEngine {
         self.hide_on_finish.remove(&hwnd);
         if hide_after {
             self.hide_on_finish.insert(hwnd);
+        }
+        if !hide_after {
+            apply_atomic_window_positions(&[(hwnd, target_rect)], false);
+            let _ = chickenwm_core::sys::attach_in_place_hit_test(HWND(hwnd as *mut _));
+            let _ = chickenwm_core::sys::set_window_cloak(HWND(hwnd as *mut _), false);
         }
         self.active.insert(
             hwnd,
@@ -335,8 +343,13 @@ impl AnimationEngine {
         {
             self.active.remove(&hwnd);
             apply_atomic_window_positions(&[(hwnd, target_rect)], false);
+            let _ = chickenwm_core::sys::attach_in_place_hit_test(HWND(hwnd as *mut _));
             return;
         }
+
+        // Snap the real HWND to target destination once with decoupled hit-testing (Architecture A):
+        apply_atomic_window_positions(&[(hwnd, target_rect)], false);
+        let _ = chickenwm_core::sys::attach_in_place_hit_test(HWND(hwnd as *mut _));
 
         self.active.insert(
             hwnd,
@@ -389,7 +402,8 @@ impl AnimationEngine {
         }
 
         if !commit_batch.is_empty() {
-            apply_animation_frame(&commit_batch);
+            // Decoupled Architecture A: Real HWNDs already sit snapped at target coordinates.
+            // intermediate animation steps transform visuals without spamming WM_SIZE.
         }
         // The last frame lands synchronously, so the window ends exactly on its target.
         if !final_batch.is_empty() {
@@ -397,7 +411,7 @@ impl AnimationEngine {
         }
         for hwnd in finished {
             if self.hide_on_finish.remove(&hwnd) {
-                chickenwm_core::failsafe::park_window(hwnd);
+                let _ = chickenwm_core::sys::set_window_cloak(HWND(hwnd as *mut _), true);
             }
         }
 
@@ -408,6 +422,7 @@ impl AnimationEngine {
         self.active.remove(&hwnd);
         self.hide_on_finish.remove(&hwnd);
         invalidate_dwm_frame_margins(hwnd);
+        chickenwm_core::sys::restore_managed_window(HWND(hwnd as *mut _));
     }
 }
 
@@ -418,6 +433,7 @@ impl AnimationEngine {
 /// one slow app used to stall the whole frame for all windows. Frames that only move a window
 /// keep its contents (no `SWP_NOCOPYBITS`, `SWP_NOSIZE`), so DWM just moves the existing surface
 /// instead of the app repainting every frame.
+#[allow(dead_code)]
 fn apply_animation_frame(frames: &[(u64, [i32; 4], bool)]) {
     let base = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS;
     for &(hwnd_u64, visible_rect, resized) in frames {

@@ -153,6 +153,7 @@ impl WmState {
     pub(crate) fn unmark_ws_hidden(&mut self, hwnd: u64) {
         self.wm_hidden_hwnds.remove(&hwnd);
         chickenwm_core::failsafe::unpark_window(hwnd);
+        let _ = chickenwm_core::sys::set_window_cloak(HWND(hwnd as *mut _), false);
     }
 
     /// Brings back every window parked (or, from older builds, hidden) for an inactive
@@ -233,7 +234,7 @@ impl WmState {
                     .animate_workspace(hwnd_u64, rect, out, true, &self.config);
             } else {
                 self.animator.remove_window(hwnd_u64);
-                chickenwm_core::failsafe::park_window(hwnd_u64);
+                let _ = chickenwm_core::sys::set_window_cloak(HWND(hwnd_u64 as *mut _), true);
             }
         }
 
@@ -326,7 +327,7 @@ impl WmState {
         } else {
             self.mark_ws_hidden(hwnd);
             self.animator.remove_window(hwnd);
-            chickenwm_core::failsafe::park_window(hwnd);
+            let _ = chickenwm_core::sys::set_window_cloak(HWND(hwnd as *mut _), true);
             let next_focus = self
                 .workspace_order
                 .get(&old_ws)

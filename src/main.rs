@@ -1225,6 +1225,7 @@ unsafe extern "system" fn win_event_proc(
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing("chickenwm_wm");
+    chickenwm_core::failsafe::install_crash_handler();
     let _failsafe = spawn_emergency_failsafe_thread();
 
     let args: Vec<String> = std::env::args().collect();
@@ -1411,8 +1412,23 @@ async fn main() -> Result<()> {
         if let Some(ref ov) = border_overlay {
             wm_loop.lock().animator.set_overlay_host_hwnd(ov.hwnd_u64());
         }
-        let mut gpu_overlay: Option<gpu_overlay::GpuBorderOverlay> = None;
-        let mut gpu_unavailable = false;
+        let mut gpu_overlay: Option<gpu_overlay::GpuBorderOverlay> = gpu_overlay::GpuBorderOverlay::create(vbounds);
+        if let Some(ref gpu) = gpu_overlay {
+            wm_loop.lock().animator.set_overlay_host_hwnd(gpu.hwnd_u64());
+        }
+        let mut _gpu_unavailable = gpu_overlay.is_none();
+
+        // Phase 5: Shell mode integration - register shell hook & taskman if explorer is suppressed
+        if chickenwm_core::failsafe::EXPLORER_KILLER_ENABLED.load(Ordering::Relaxed) {
+            let hook_hwnd = gpu_overlay
+                .as_ref()
+                .map(|g| g.hwnd())
+                .or_else(|| border_overlay.as_ref().map(|b| windows::Win32::Foundation::HWND(b.hwnd_u64() as *mut core::ffi::c_void)));
+            if let Some(h) = hook_hwnd {
+                chickenwm_core::sys::register_shell_hook_window(h);
+                chickenwm_core::sys::set_taskman_window(h);
+            }
+        }
 
         let mut scheduler = AdaptiveFrameScheduler::new(pacer_loop.clone());
         WM_LOOP_THREAD_ID.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
@@ -1637,13 +1653,13 @@ async fn main() -> Result<()> {
                 )
             };
 
-            // DWM hook mode draws the borders on the GPU (DirectComposition); if that can't
+            // DirectComposition overlay draws borders on the GPU; if that can't
             // start, the CPU layered overlay carries on. Only one of them is ever shown.
-            if dwm_hook && gpu_overlay.is_none() && !gpu_unavailable {
+            if gpu_overlay.is_none() && !_gpu_unavailable {
                 gpu_overlay = gpu_overlay::GpuBorderOverlay::create(vbounds);
-                gpu_unavailable = gpu_overlay.is_none();
+                _gpu_unavailable = gpu_overlay.is_none();
             }
-            let use_gpu = dwm_hook && gpu_overlay.is_some();
+            let use_gpu = gpu_overlay.is_some();
             if let Some(ref mut gpu) = gpu_overlay {
                 gpu.set_hidden(fullscreen || !use_gpu);
                 if use_gpu && !fullscreen {

@@ -124,12 +124,34 @@ pub fn apply_window_decorations(
                 _ => 3,         // DWMSBT_TRANSIENTWINDOW (Acrylic)
             }
         };
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_SYSTEMBACKDROP_TYPE,
-            &backdrop_type as *const u32 as *const core::ffi::c_void,
-            size_of::<u32>() as u32,
-        );
+        if decoration.blur_enabled {
+            let res = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_SYSTEMBACKDROP_TYPE,
+                &backdrop_type as *const u32 as *const core::ffi::c_void,
+                size_of::<u32>() as u32,
+            );
+            if res.is_err() {
+                let accent_state = match decoration.blur_style.as_str() {
+                    "acrylic" => chickenwm_core::sys::ACCENT_STATE::AccentEnableAcrylicblurbehind,
+                    _ => chickenwm_core::sys::ACCENT_STATE::AccentEnableBlurbehind,
+                };
+                let policy = chickenwm_core::sys::ACCENT_POLICY {
+                    accent_state,
+                    accent_flags: 2,
+                    gradient_color: 0x99000000,
+                    animation_id: 0,
+                };
+                chickenwm_core::sys::set_window_accent_policy(hwnd, &policy);
+            }
+        } else {
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_SYSTEMBACKDROP_TYPE,
+                &backdrop_type as *const u32 as *const core::ffi::c_void,
+                size_of::<u32>() as u32,
+            );
+        }
 
         // 5. Window opacity via WS_EX_LAYERED + SetLayeredWindowAttributes
         let target_opacity = custom_opacity.unwrap_or_else(|| {

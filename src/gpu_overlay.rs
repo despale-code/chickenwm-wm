@@ -70,8 +70,8 @@ VsOut vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     Border b = borders[iid];
     float x = b.rect.x, y = b.rect.y, w = b.rect.z, h = b.rect.w;
     float bw = b.params.x, r = b.params.y;
-    float pad = bw + 1.5;
-    float corner = min(r + bw + 1.5, h * 0.5);
+    float pad = (b.params.w > 1.5) ? (bw + 12.0) : (bw + 1.5);
+    float corner = min(r + pad, h * 0.5);
     uint strip = vid / 6;
     float4 box;
     if (b.params.w > 0.5) {
@@ -107,18 +107,29 @@ float4 ps_main(VsOut i) : SV_Target {
 
     float4 color;
     float aa;
-    if (b.params.w > 0.5) {
+    if (b.params.w > 0.5 && b.params.w < 1.5) {
         // Drop preview: faint fill, slightly stronger edge.
         if (sdf > 0.5) discard;
         aa = saturate(0.5 - sdf);
         color = float4(b.c1.rgb, sdf > -2.5 ? 150.0 / 255.0 : 38.0 / 255.0);
     } else {
         // The ring lies in sdf [-1, bw].
-        if (sdf < -1.0 || sdf > bw + 0.5) discard;
+        if (sdf <= bw + 0.5) {
+            if (sdf < -1.0) discard;
         aa = sdf < 0.0 ? saturate(1.0 + sdf) : (sdf > bw - 0.5 ? saturate(bw + 0.5 - sdf) : 1.0);
         float2 dir = float2(cos(b.params.z), sin(b.params.z));
         float t = saturate(dot(normalize(p + 1e-4), dir) * 0.5 + 0.5);
         color = lerp(b.c1, b.c2, t);
+        } else if (b.params.w > 1.5) {
+            float shadow_dist = sdf - bw;
+            float shadow_max = 10.0;
+            if (shadow_dist > shadow_max) discard;
+            float shadow_factor = 1.0 - smoothstep(0.0, shadow_max, shadow_dist);
+            color = float4(0.0, 0.0, 0.0, 0.35 * shadow_factor);
+            aa = 1.0;
+        } else {
+            discard;
+        }
     }
     float a = color.a * aa;
     return float4(color.rgb * a, a);
@@ -378,6 +389,7 @@ impl GpuBorderOverlay {
     unsafe fn build(hwnd: HWND, bounds: [i32; 4], width: u32, height: u32) -> WinResult<Self> {
         unsafe {
             SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA)?;
+            let _ = chickenwm_core::sys::set_overlay_capture_exclusion(hwnd);
             let pipeline = Pipeline::new(width, height)?;
 
             let dxgi_device: IDXGIDevice = pipeline.device.cast()?;
@@ -425,6 +437,16 @@ impl GpuBorderOverlay {
         }
     }
 
+    /// Underlying overlay window HWND.
+    pub fn hwnd(&self) -> HWND {
+        self.hwnd
+    }
+
+    /// Underlying overlay window HWND as u64.
+    pub fn hwnd_u64(&self) -> u64 {
+        self.hwnd.0 as u64
+    }
+
     /// Hides the overlay (fullscreen apps, or the CPU overlay is in use) or shows it again.
     pub fn set_hidden(&mut self, hidden: bool) {
         if hidden == self.hidden {
@@ -436,6 +458,49 @@ impl GpuBorderOverlay {
         }
         if !hidden {
             self.last = None;
+        }
+    }
+
+    /// Attaches an HWND's live DWM redirection visual into the DirectComposition overlay tree (Architecture A).
+    #[allow(dead_code)]
+    pub fn attach_thumbnail_visual(&self, source_hwnd: HWND) -> Option<(IDCompositionVisual, isize)> {
+        let dcomp_raw = self._dcomp.as_raw();
+        if let Ok((v2, thumb_id)) = chickenwm_core::sys::create_shared_thumbnail_visual(self.hwnd, source_hwnd, dcomp_raw) {
+            if let Ok(vis) = v2.cast::<IDCompositionVisual>() {
+                unsafe {
+                    let _ = self._visual.AddVisual(&vis, windows::Win32::Foundation::BOOL(0), None);
+                    let _ = self._dcomp.Commit();
+                }
+                return Some((vis, thumb_id));
+            }
+        }
+        None
+    }
+
+    /// Detaches a live DWM thumbnail visual from the composition tree.
+    #[allow(dead_code)]
+    pub fn detach_thumbnail_visual(&self, visual: &IDCompositionVisual, thumb_id: isize) {
+        unsafe {
+            let _ = self._visual.RemoveVisual(visual);
+            let _ = self._dcomp.Commit();
+            let _ = windows::Win32::Graphics::Dwm::DwmUnregisterThumbnail(thumb_id);
+        }
+    }
+
+    /// Updates the position of a live DWM thumbnail visual in the overlay.
+    #[allow(dead_code)]
+    pub fn update_thumbnail_visual_pos(&self, visual: &IDCompositionVisual, x: f32, y: f32) {
+        unsafe {
+            let _ = visual.SetOffsetX2(x);
+            let _ = visual.SetOffsetY2(y);
+        }
+    }
+
+    /// Commits all pending visual updates in the DirectComposition tree.
+    #[allow(dead_code)]
+    pub fn commit_dcomp(&self) {
+        unsafe {
+            let _ = self._dcomp.Commit();
         }
     }
 
@@ -519,11 +584,12 @@ fn border_items(
                 continue;
             }
             let angle = spec.angle_deg.to_radians() + if t.focus_t > 0.5 { phase * t.focus_t } else { 0.0 };
+            let kind = if decoration.drop_shadow { 2.0 } else { 0.0 };
             items.push(GpuBorder {
                 rect: local(t.rect),
                 c1: rgba(spec.primary),
                 c2: rgba(spec.secondary.unwrap_or(spec.primary)),
-                params: [bw, radius, angle, 0.0],
+                params: [bw, radius, angle, kind],
             });
         }
     }
