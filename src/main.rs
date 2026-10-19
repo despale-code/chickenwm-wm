@@ -1663,7 +1663,7 @@ async fn main() -> Result<()> {
             if let Some(ref mut gpu) = gpu_overlay {
                 gpu.set_hidden(fullscreen || !use_gpu);
                 if use_gpu && !fullscreen {
-                    gpu.render_frame(dt, &targets, &general, &decoration, drop_preview);
+                    gpu.render_frame(dt, &targets, &general, &decoration, dwm_hook, drop_preview);
                 }
             }
             if let Some(ref mut overlay) = border_overlay {

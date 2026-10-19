@@ -156,9 +156,6 @@ impl AnimationEngine {
             }
         }
         apply_atomic_window_positions(&direct, false);
-        for &(hwnd, _) in &direct {
-            let _ = chickenwm_core::sys::attach_in_place_hit_test(HWND(hwnd as *mut _));
-        }
     }
 
     /// Starts or retargets a smooth cubic-bezier animation for `hwnd` toward `target_rect`.
@@ -211,7 +208,6 @@ impl AnimationEngine {
         }
         if !hide_after {
             apply_atomic_window_positions(&[(hwnd, target_rect)], false);
-            let _ = chickenwm_core::sys::attach_in_place_hit_test(HWND(hwnd as *mut _));
             let _ = chickenwm_core::sys::set_window_cloak(HWND(hwnd as *mut _), false);
         }
         self.active.insert(
@@ -343,13 +339,9 @@ impl AnimationEngine {
         {
             self.active.remove(&hwnd);
             apply_atomic_window_positions(&[(hwnd, target_rect)], false);
-            let _ = chickenwm_core::sys::attach_in_place_hit_test(HWND(hwnd as *mut _));
             return;
         }
 
-        // Snap the real HWND to target destination once with decoupled hit-testing (Architecture A):
-        apply_atomic_window_positions(&[(hwnd, target_rect)], false);
-        let _ = chickenwm_core::sys::attach_in_place_hit_test(HWND(hwnd as *mut _));
 
         self.active.insert(
             hwnd,
@@ -402,8 +394,7 @@ impl AnimationEngine {
         }
 
         if !commit_batch.is_empty() {
-            // Decoupled Architecture A: Real HWNDs already sit snapped at target coordinates.
-            // intermediate animation steps transform visuals without spamming WM_SIZE.
+            apply_animation_frame(&commit_batch);
         }
         // The last frame lands synchronously, so the window ends exactly on its target.
         if !final_batch.is_empty() {
