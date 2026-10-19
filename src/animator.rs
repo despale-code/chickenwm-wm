@@ -14,7 +14,7 @@ use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetWindowRect, IsZoomed, SetWindowPos,
-    SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE,
+    SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE,
     SWP_NOZORDER,
 };
 
@@ -367,13 +367,20 @@ impl AnimationEngine {
         let mut current_visible_rects = Vec::with_capacity(self.active.len());
         let mut finished = Vec::new();
 
+        let mut final_batch = Vec::new();
         for (&hwnd, anim) in self.active.iter_mut() {
+            let prev = anim.current_rect;
+            // The start rect isn't necessarily the window's real size, so the first frame sizes it.
+            let first_frame = anim.elapsed_secs == 0.0;
             let rect = anim.step(dt);
             current_visible_rects.push((hwnd, rect));
-            commit_batch.push((hwnd, rect));
 
             if anim.is_finished() {
                 finished.push(hwnd);
+                final_batch.push((hwnd, rect));
+            } else {
+                let resized = first_frame || prev[2] != rect[2] || prev[3] != rect[3];
+                commit_batch.push((hwnd, rect, resized));
             }
         }
 
@@ -382,7 +389,11 @@ impl AnimationEngine {
         }
 
         if !commit_batch.is_empty() {
-            apply_atomic_window_positions(&commit_batch, false);
+            apply_animation_frame(&commit_batch);
+        }
+        // The last frame lands synchronously, so the window ends exactly on its target.
+        if !final_batch.is_empty() {
+            apply_atomic_window_positions(&final_batch, false);
         }
         for hwnd in finished {
             if self.hide_on_finish.remove(&hwnd) {
@@ -397,6 +408,25 @@ impl AnimationEngine {
         self.active.remove(&hwnd);
         self.hide_on_finish.remove(&hwnd);
         invalidate_dwm_frame_margins(hwnd);
+    }
+}
+
+/// One in-between animation frame: `(hwnd, visible rect, size changed since the last frame)`.
+///
+/// Unlike [`apply_atomic_window_positions`] this never waits on the windows' own threads
+/// (`SWP_ASYNCWINDOWPOS`): `EndDeferWindowPos` blocks until every app has handled its move, so
+/// one slow app used to stall the whole frame for all windows. Frames that only move a window
+/// keep its contents (no `SWP_NOCOPYBITS`, `SWP_NOSIZE`), so DWM just moves the existing surface
+/// instead of the app repainting every frame.
+fn apply_animation_frame(frames: &[(u64, [i32; 4], bool)]) {
+    let base = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS;
+    for &(hwnd_u64, visible_rect, resized) in frames {
+        let [x, y, w, h] = compensate_dwm_frame_bounds(hwnd_u64, visible_rect);
+        let flags = if resized { base | SWP_NOCOPYBITS } else { base | SWP_NOSIZE };
+        let hwnd = HWND(hwnd_u64 as *mut core::ffi::c_void);
+        unsafe {
+            let _ = SetWindowPos(hwnd, None, x, y, w.max(50), h.max(40), flags);
+        }
     }
 }
 
