@@ -125,7 +125,6 @@ impl WmState {
                 .map(|m| m.name.clone())
                 .unwrap_or_else(|| r"\\.\DISPLAY1".to_string()),
             monitor_refresh_hz: primary_mon.map(|m| m.refresh_rate_hz).unwrap_or(60),
-            dwm_hook_active: self.config.misc.dwm_hook_enabled,
         }
     }
 

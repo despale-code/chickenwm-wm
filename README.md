@@ -18,7 +18,7 @@ Windows 10 or 11 (64-bit) and Rust 1.85 or newer:
 cargo build --release
 ```
 
-It depends on [chickenwm-core](https://github.com/despale-code/chickenwm-core) and [chickenwm-dwm-hook](https://github.com/despale-code/chickenwm-dwm-hook), which Cargo fetches from GitHub.
+It depends on [chickenwm-core](https://github.com/despale-code/chickenwm-core), which Cargo fetches from GitHub.
 
 ## License
 

@@ -1355,27 +1355,7 @@ async fn main() -> Result<()> {
                             ),
                         }
                     }
-                    IpcCommand::SetCompositorMode { dwm_hook_enabled } => {
-                        {
-                            let mut st = wm.lock();
-                            st.config.misc.dwm_hook_enabled = dwm_hook_enabled;
-                            st.broadcast_bar_state();
-                        }
-                        if dwm_hook_enabled {
-                            if let Ok(mut dll) = std::env::current_exe() {
-                                dll.set_file_name("chickenwm_dwm_hook.dll");
-                                if dll.exists() {
-                                    let _ = chickenwm_dwm_hook::inject_into_dwm(&dll);
-                                }
-                            }
-                        } else {
-                            let _ = chickenwm_dwm_hook::eject_from_dwm();
-                        }
-                        pacer.wake();
-                        IpcResponse::Ok {
-                            message: format!("DWM Hook Mode set to {dwm_hook_enabled}"),
-                        }
-                    }
+
                     IpcCommand::QueryClients => {
                         let list: Vec<ClientInfo> = wm.lock().clients.values().cloned().collect();
                         IpcResponse::Clients(list)
@@ -1580,23 +1560,6 @@ async fn main() -> Result<()> {
             // that isn't managed yet gets adopted.
             if last_sweep.elapsed() >= std::time::Duration::from_millis(1500) {
                 last_sweep = std::time::Instant::now();
-                let hook_enabled = wm_loop.lock().config.misc.dwm_hook_enabled;
-                if hook_enabled {
-                    for telem in chickenwm_dwm_hook::poll_dwm_telemetry() {
-                        if telem.hwnd != 0 {
-                            let mut st = wm_loop.lock();
-                            match telem.kind {
-                                chickenwm_dwm_hook::DwmEventKind::WindowCreated => {
-                                    st.add_or_show_window(telem.hwnd);
-                                }
-                                chickenwm_dwm_hook::DwmEventKind::WindowDestroyed => {
-                                    st.remove_window(telem.hwnd);
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
                 let found = discover_manageable_windows();
                 let mut st = wm_loop.lock();
                 // Apps (and some toolkits on resize/show) put their native frame back; strip it
@@ -1639,7 +1602,7 @@ async fn main() -> Result<()> {
                 scheduler.sample_delta_seconds()
             };
 
-            let (targets, general, decoration, dwm_hook, fullscreen, drop_preview) = {
+            let (targets, general, decoration, fullscreen, drop_preview) = {
                 let mut st = wm_loop.lock();
                 let current_rects = st.animator.tick(dt);
                 let bt = st.border_targets(&current_rects);
@@ -1647,7 +1610,6 @@ async fn main() -> Result<()> {
                     bt,
                     st.config.general.clone(),
                     st.config.decoration.clone(),
-                    st.config.misc.dwm_hook_enabled,
                     st.fullscreen_active(),
                     st.drop_preview(),
                 )
@@ -1663,7 +1625,7 @@ async fn main() -> Result<()> {
             if let Some(ref mut gpu) = gpu_overlay {
                 gpu.set_hidden(fullscreen || !use_gpu);
                 if use_gpu && !fullscreen {
-                    gpu.render_frame(dt, &targets, &general, &decoration, dwm_hook, drop_preview);
+                    gpu.render_frame(dt, &targets, &general, &decoration, drop_preview);
                 }
             }
             if let Some(ref mut overlay) = border_overlay {
@@ -1672,7 +1634,7 @@ async fn main() -> Result<()> {
                 // latency — so the overlay steps aside while something is fullscreen.
                 overlay.set_hidden(fullscreen || use_gpu);
                 if !fullscreen && !use_gpu {
-                    overlay.render_frame(dt, &targets, &general, &decoration, dwm_hook, drop_preview);
+                    overlay.render_frame(dt, &targets, &general, &decoration, drop_preview);
                 }
             }
         }

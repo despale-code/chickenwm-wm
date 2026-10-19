@@ -2,7 +2,6 @@
 //! Titlebar Stripping, Rounded Corners, and Click-Through Animated Gradient Border Overlay.
 
 use chickenwm_core::config::{BorderColorSpec, DecorationConfig, GeneralConfig, RgbaColor};
-use chickenwm_dwm_hook::DwmVisualTransform;
 use std::collections::HashMap;
 use std::mem::size_of;
 use std::time::{Duration, Instant};
@@ -185,6 +184,7 @@ pub fn apply_window_decorations(
 pub struct WindowBorderTarget {
     pub hwnd: u64,
     pub rect: [i32; 4], // [x, y, width, height]
+    #[allow(dead_code)]
     pub is_active: bool,
     /// 0 = inactive look, 1 = active look; in between while focus moves (a short fade).
     pub focus_t: f32,
@@ -369,25 +369,18 @@ impl BorderOverlayWindow {
         }
     }
 
-    /// Renders smooth anti-aliased rounded gradient borders around `targets`, or forwards
-    /// zero-latency transforms to `chickenwm-dwm-hook` when `dwm_hook_enabled` is true.
+    /// Renders smooth anti-aliased rounded gradient borders around `targets`.
     pub fn render_frame(
         &mut self,
         dt: f32,
         targets: &[WindowBorderTarget],
         general: &GeneralConfig,
         decoration: &DecorationConfig,
-        dwm_hook_enabled: bool,
         // Where a dragged tile will land: drawn as a soft highlight.
         drop_preview: Option<[i32; 4]>,
     ) {
         self.phase_rad =
             (self.phase_rad + dt * decoration.border_anim_speed * 2.2) % std::f32::consts::TAU;
-
-        if dwm_hook_enabled {
-            stream_to_dwm_hook(self.phase_rad, targets, general, decoration);
-        }
-
         if general.border_size <= 0 {
             return;
         }
@@ -566,36 +559,6 @@ impl BorderOverlayWindow {
             let _ = UpdateLayeredWindowIndirect(self.hwnd, &info);
         }
     }
-}
-
-/// DWM hook mode: streams the frame's window transforms to the in-process DWM hook over
-/// `\\.\pipe\dwm_ipc` (`chickenwm-dwm-hook`).
-pub(crate) fn stream_to_dwm_hook(
-    phase_rad: f32,
-    targets: &[WindowBorderTarget],
-    general: &GeneralConfig,
-    decoration: &DecorationConfig,
-) {
-    let mut batch = Vec::with_capacity(targets.len());
-    for t in targets {
-        let spec = if t.is_active { &general.col_active_border } else { &general.col_inactive_border };
-        let primary = spec.primary.to_normalized_f32();
-        let secondary = spec.secondary.unwrap_or(spec.primary).to_normalized_f32();
-        batch.push(DwmVisualTransform {
-            hwnd: t.hwnd,
-            scale_x: 1.0,
-            scale_y: 1.0,
-            translate_x: t.rect[0] as f32,
-            translate_y: t.rect[1] as f32,
-            opacity: if t.is_active { decoration.active_opacity } else { decoration.inactive_opacity },
-            corner_radius: decoration.rounding as f32,
-            border_rgba: primary,
-            border_rgba_secondary: secondary,
-            border_angle_deg: spec.angle_deg + phase_rad.to_degrees(),
-            border_width: general.border_size as f32,
-        });
-    }
-    let _ = chickenwm_dwm_hook::update_dwm_visual_transforms_batch(&batch);
 }
 
 /// A border's colours part-way through the focus fade (shared with the GPU overlay).

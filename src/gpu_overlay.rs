@@ -6,7 +6,7 @@
 //! border; one instanced draw turns each into four thin strips around the window, and the pixel
 //! shader computes the same anti-aliased rounded gradient ring as the CPU rasterizer.
 
-use crate::effects::{border_spec_for, stream_to_dwm_hook, WindowBorderTarget};
+use crate::effects::{border_spec_for, WindowBorderTarget};
 use chickenwm_core::config::{DecorationConfig, GeneralConfig, RgbaColor};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -510,14 +510,9 @@ impl GpuBorderOverlay {
         targets: &[WindowBorderTarget],
         general: &GeneralConfig,
         decoration: &DecorationConfig,
-        dwm_hook_enabled: bool,
         drop_preview: Option<[i32; 4]>,
     ) {
         self.phase_rad = (self.phase_rad + dt * decoration.border_anim_speed * 2.2) % std::f32::consts::TAU;
-        if dwm_hook_enabled {
-            stream_to_dwm_hook(self.phase_rad, targets, general, decoration);
-        }
-
         let items = border_items(self.bounds, self.phase_rad, targets, general, decoration, drop_preview);
         // Nothing changed: the last presented frame is still on screen.
         if self.last.as_ref() == Some(&items) {
