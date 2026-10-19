@@ -14,6 +14,7 @@
 mod animator;
 mod drag_resize;
 mod effects;
+mod gpu_overlay;
 mod input_focus;
 mod layout;
 mod overlay_glue;
@@ -1410,6 +1411,8 @@ async fn main() -> Result<()> {
         if let Some(ref ov) = border_overlay {
             wm_loop.lock().animator.set_overlay_host_hwnd(ov.hwnd_u64());
         }
+        let mut gpu_overlay: Option<gpu_overlay::GpuBorderOverlay> = None;
+        let mut gpu_unavailable = false;
 
         let mut scheduler = AdaptiveFrameScheduler::new(pacer_loop.clone());
         WM_LOOP_THREAD_ID.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
@@ -1634,12 +1637,25 @@ async fn main() -> Result<()> {
                 )
             };
 
+            // DWM hook mode draws the borders on the GPU (DirectComposition); if that can't
+            // start, the CPU layered overlay carries on. Only one of them is ever shown.
+            if dwm_hook && gpu_overlay.is_none() && !gpu_unavailable {
+                gpu_overlay = gpu_overlay::GpuBorderOverlay::create(vbounds);
+                gpu_unavailable = gpu_overlay.is_none();
+            }
+            let use_gpu = dwm_hook && gpu_overlay.is_some();
+            if let Some(ref mut gpu) = gpu_overlay {
+                gpu.set_hidden(fullscreen || !use_gpu);
+                if use_gpu && !fullscreen {
+                    gpu.render_frame(dt, &targets, &general, &decoration, drop_preview);
+                }
+            }
             if let Some(ref mut overlay) = border_overlay {
                 // A window above a fullscreen game (even a transparent click-through one)
                 // stops DWM handing the game's frames straight to the display, costing FPS and
                 // latency — so the overlay steps aside while something is fullscreen.
-                overlay.set_hidden(fullscreen);
-                if !fullscreen {
+                overlay.set_hidden(fullscreen || use_gpu);
+                if !fullscreen && !use_gpu {
                     overlay.render_frame(dt, &targets, &general, &decoration, dwm_hook, drop_preview);
                 }
             }
