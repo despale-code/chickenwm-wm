@@ -57,6 +57,18 @@ pub fn strip_native_frame(hwnd_u64: u64, strip_styles: bool) -> bool {
             &none as *const u32 as *const core::ffi::c_void,
             size_of::<u32>() as u32,
         );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(35), // DWMWA_CAPTION_COLOR
+            &none as *const u32 as *const core::ffi::c_void,
+            size_of::<u32>() as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(36), // DWMWA_TEXT_COLOR
+            &none as *const u32 as *const core::ffi::c_void,
+            size_of::<u32>() as u32,
+        );
         if !strip_styles {
             return false;
         }
