@@ -6,6 +6,8 @@
 //! border; one instanced draw turns each into four thin strips around the window, and the pixel
 //! shader computes the same anti-aliased rounded gradient ring as the CPU rasterizer.
 
+#![allow(dead_code)]
+
 use crate::effects::{border_spec_for, WindowBorderTarget};
 use chickenwm_core::config::{DecorationConfig, GeneralConfig, RgbaColor};
 use std::time::{Duration, Instant};

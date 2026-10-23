@@ -1615,28 +1615,15 @@ async fn main() -> Result<()> {
                 )
             };
 
-            // DirectComposition overlay draws borders on the GPU; if that can't
-            // start, the CPU layered overlay carries on. Only one of them is ever shown.
-            if gpu_overlay.is_none() && !_gpu_unavailable {
-                gpu_overlay = gpu_overlay::GpuBorderOverlay::create(vbounds);
-                _gpu_unavailable = gpu_overlay.is_none();
-            }
-            let use_gpu = gpu_overlay.is_some();
+            // Old border function is obsolete: coop renders hardware borders natively on its Vulkan canvas.
+            // DirectComposition and GDI layered overlays are permanently disabled.
             if let Some(ref mut gpu) = gpu_overlay {
-                gpu.set_hidden(fullscreen || !use_gpu);
-                if use_gpu && !fullscreen {
-                    gpu.render_frame(dt, &targets, &general, &decoration, drop_preview);
-                }
+                gpu.set_hidden(true);
             }
             if let Some(ref mut overlay) = border_overlay {
-                // A window above a fullscreen game (even a transparent click-through one)
-                // stops DWM handing the game's frames straight to the display, costing FPS and
-                // latency — so the overlay steps aside while something is fullscreen.
-                overlay.set_hidden(fullscreen || use_gpu);
-                if !fullscreen && !use_gpu {
-                    overlay.render_frame(dt, &targets, &general, &decoration, drop_preview);
-                }
+                overlay.set_hidden(true);
             }
+            let _ = (targets, general, decoration, fullscreen, drop_preview);
         }
     })
     .await?;

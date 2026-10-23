@@ -1,6 +1,8 @@
 //! Phase 5.1 & 5.5: Window DWM Quirks Normalization, Opacity, Blur/Acrylic/Mica,
 //! Titlebar Stripping, Rounded Corners, and Click-Through Animated Gradient Border Overlay.
 
+#![allow(dead_code)]
+
 use chickenwm_core::config::{BorderColorSpec, DecorationConfig, GeneralConfig, RgbaColor};
 use std::collections::HashMap;
 use std::mem::size_of;
