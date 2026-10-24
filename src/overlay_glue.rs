@@ -73,11 +73,6 @@ impl WmState {
         }
     }
 
-    pub(crate) fn focus_fading(&self) -> bool {
-        self.focus_anim
-            .is_some_and(|(_, _, at)| at.elapsed().as_secs_f32() < 0.2)
-    }
-
     /// While a tiled window is moved with the mouse: the slot it will drop into.
     pub(crate) fn drop_preview(&self) -> Option<[i32; 4]> {
         if !self.drag_is_move {

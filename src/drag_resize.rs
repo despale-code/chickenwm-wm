@@ -9,14 +9,9 @@ use crate::input_focus::force_foreground_window;
 use crate::layout::{tiled_inner_area, BspNode, SplitAxis};
 use crate::{WmEvent, WmState};
 use chickenwm_core::ipc::Action;
-use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
-use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
-use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowRect, SendMessageTimeoutW, SMTO_ABORTIFHUNG, SMTO_NORMAL,
-    WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE,
-};
+use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 
 /// Signaled when a plain-LMB border grab (`general:resize_on_border`) is actively resizing a window.
 pub(crate) static BORDER_DRAG_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -69,36 +64,6 @@ pub(crate) fn coalesce_drag_updates(events: Vec<WmEvent>) -> Vec<WmEvent> {
         .zip(keep)
         .filter_map(|(ev, k)| k.then_some(ev))
         .collect()
-}
-
-/// Sends a payload-free sizing notification (`WM_ENTERSIZEMOVE` / `WM_EXITSIZEMOVE`) to each
-/// window, skipping any that don't respond within 100ms so a hung app can't stall the WM.
-pub(crate) fn send_sizing_notification(hwnds: &[u64], msg: u32) {
-    for &h in hwnds {
-        unsafe {
-            let _ = SendMessageTimeoutW(
-                HWND(h as *mut core::ffi::c_void),
-                msg,
-                WPARAM(0),
-                LPARAM(0),
-                SMTO_ABORTIFHUNG | SMTO_NORMAL,
-                100,
-                None,
-            );
-        }
-    }
-}
-
-
-
-/// The visible size the window actually took after a resize.
-pub(crate) fn visible_frame_size(hwnd: u64) -> Option<(i32, i32)> {
-    let mut rc = RECT::default();
-    unsafe {
-        GetWindowRect(HWND(hwnd as *mut core::ffi::c_void), &mut rc).ok()?;
-    }
-    let [l, t, r, b] = animator::get_dwm_frame_margins(hwnd);
-    Some((rc.right - rc.left - l - r, rc.bottom - rc.top - t - b))
 }
 
 /// Moves one side of the span `[pos, pos + len)` by `delta`: the start side when `edge < 0`,
