@@ -1140,7 +1140,6 @@ fn inspect_window(hwnd_u64: u64) -> Option<ClientInfo> {
 
         if process_name.eq_ignore_ascii_case("chickenwm-launcher.exe")
             || process_name.eq_ignore_ascii_case("chickenwm-notify.exe")
-            || process_name.eq_ignore_ascii_case("chickenwm-downloader.exe")
             || process_name.eq_ignore_ascii_case("roobar.exe")
             || title.starts_with("ChickenWM Bar")
         {
