@@ -393,6 +393,7 @@ impl WmState {
                 self.mark_ws_hidden(hwnd);
                 chickenwm_core::failsafe::park_window(hwnd);
             }
+            effects::set_window_tiled_prop(hwnd, !is_float && !info.fullscreen);
             self.clients.insert(hwnd, info);
             if !is_float {
                 let list = self.workspace_order.entry(ws).or_default();
@@ -502,6 +503,7 @@ impl WmState {
         // has it, or when it belongs to the focused app (its dialogs, its second window).
         let take_focus = self.new_window_may_take_focus(hwnd);
         self.mark_fresh(hwnd);
+        effects::set_window_tiled_prop(hwnd, !is_float && !info.fullscreen);
         self.clients.insert(hwnd, info);
 
         if !is_float {
@@ -836,6 +838,7 @@ impl WmState {
                     let ws = self.active_workspace;
                     if let Some(c) = self.clients.get_mut(&hwnd) {
                         c.floating = !c.floating;
+                        effects::set_window_tiled_prop(hwnd, !c.floating && !c.fullscreen);
                         if c.floating {
                             if let Some(tree) = self.workspace_bsp.remove(&ws) {
                                 if let Some(nt) = tree.remove(hwnd) {
@@ -861,6 +864,7 @@ impl WmState {
                 if let Some(hwnd) = self.focused_hwnd {
                     if let Some(c) = self.clients.get_mut(&hwnd) {
                         c.fullscreen = !c.fullscreen;
+                        effects::set_window_tiled_prop(hwnd, !c.floating && !c.fullscreen);
                         apply_window_decorations(
                             hwnd,
                             c.focused,
@@ -1567,6 +1571,7 @@ async fn main() -> Result<()> {
                 let strip_styles = st.config.general.no_titlebars;
                 let mut restyled = false;
                 for (&hwnd, c) in &st.clients {
+                    effects::set_window_tiled_prop(hwnd, !c.floating && !c.fullscreen);
                     if !c.fullscreen {
                         restyled |= effects::strip_native_frame(hwnd, strip_styles);
                     }

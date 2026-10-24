@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::mem::size_of;
 use std::time::{Duration, Instant};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{BOOL, COLORREF, HWND, POINT, RECT, SIZE};
+use windows::Win32::Foundation::{BOOL, COLORREF, HANDLE, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_TRANSITIONS_FORCEDISABLED,
     DWMWA_WINDOW_CORNER_PREFERENCE,
@@ -20,15 +20,37 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetWindowLongPtrW, RegisterClassW,
-    SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    CreateWindowExW, DefWindowProcW, GetWindowLongPtrW, RegisterClassW, RemovePropW,
+    SetLayeredWindowAttributes, SetPropW, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     UpdateLayeredWindowIndirect, UPDATELAYEREDWINDOWINFO,
     CS_HREDRAW, CS_VREDRAW, GWL_EXSTYLE, GWL_STYLE, HWND_TOPMOST, LWA_ALPHA, SWP_FRAMECHANGED,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA,
     WNDCLASSW,
-    WS_CAPTION, WS_THICKFRAME, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    WS_CAPTION, WS_SYSMENU, WS_THICKFRAME, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
+
+/// Marks `hwnd` with Win32 window properties (`ChickenWM_Managed` and `ChickenWM_Tiled`) so
+/// `coop` only applies forced border radius to tiled windows.
+pub fn set_window_tiled_prop(hwnd_u64: u64, is_tiled: bool) {
+    let hwnd = HWND(hwnd_u64 as *mut core::ffi::c_void);
+    unsafe {
+        let _ = SetPropW(
+            hwnd,
+            windows::core::w!("ChickenWM_Managed"),
+            HANDLE(1 as *mut core::ffi::c_void),
+        );
+        if is_tiled {
+            let _ = SetPropW(
+                hwnd,
+                windows::core::w!("ChickenWM_Tiled"),
+                HANDLE(1 as *mut core::ffi::c_void),
+            );
+        } else {
+            let _ = RemovePropW(hwnd, windows::core::w!("ChickenWM_Tiled"));
+        }
+    }
+}
 
 /// Phase 5.1: Force-disables native Windows DWM transitions (`DWMWA_TRANSITIONS_FORCEDISABLED`)
 /// on a managed window so native animations never conflict with ChickenWM's cubic-bezier engine.
@@ -76,7 +98,7 @@ pub fn strip_native_frame(hwnd_u64: u64, _strip_styles: bool) -> bool {
 
         let cur = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
         let frame = WS_CAPTION.0 | WS_THICKFRAME.0;
-        if (cur & WS_POPUP.0) == 0 && (cur & frame) != frame {
+        if (cur & WS_SYSMENU.0) != 0 && (cur & WS_POPUP.0) == 0 && (cur & frame) != frame {
             let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, (cur | frame) as isize);
             let _ = SetWindowPos(
                 hwnd,
