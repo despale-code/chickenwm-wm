@@ -179,9 +179,9 @@ impl WmState {
         true
     }
 
-    /// Handles the completion of a native Win32 border drag/resize (`EVENT_SYSTEM_MOVESIZEEND`)
-    /// so resizing a window by its border adjusts its tile ratio instead of snapping back.
-    pub(crate) fn handle_native_movesize_end(&mut self, hwnd: u64) {
+    /// Updates neighboring tiled windows in real time on every frame while `hwnd` is inside a
+    /// native Win32 border drag/resize loop (`EVENT_SYSTEM_MOVESIZESTART` .. `EVENT_SYSTEM_MOVESIZEEND`).
+    pub(crate) fn handle_native_movesize_tick(&mut self, hwnd: u64) {
         if self.drag_target_hwnd.is_some() {
             return;
         }
@@ -194,37 +194,94 @@ impl WmState {
 
         let hwnd_win = HWND(hwnd as *mut core::ffi::c_void);
         let mut rc = RECT::default();
-        unsafe {
-            if DwmGetWindowAttribute(
-                hwnd_win,
-                DWMWA_EXTENDED_FRAME_BOUNDS,
-                &mut rc as *mut RECT as *mut core::ffi::c_void,
-                size_of::<RECT>() as u32,
-            )
-            .is_err()
-            {
-                let _ = GetWindowRect(hwnd_win, &mut rc);
-            }
+        if unsafe { GetWindowRect(hwnd_win, &mut rc) }.is_err() {
+            return;
         }
+        let [l, t, r, b] = animator::get_dwm_frame_margins(hwnd);
         let new_rect = [
-            rc.left,
-            rc.top,
-            (rc.right - rc.left).max(100),
-            (rc.bottom - rc.top).max(80),
+            rc.left + l,
+            rc.top + t,
+            (rc.right - rc.left - l - r).max(100),
+            (rc.bottom - rc.top - t - b).max(80),
         ];
 
         if client.floating {
             if let Some(c) = self.clients.get_mut(&hwnd) {
                 c.rect = new_rect;
             }
+            return;
+        }
+
+        let left_dx = new_rect[0] - client.rect[0];
+        let right_dx = (new_rect[0] + new_rect[2]) - (client.rect[0] + client.rect[2]);
+        let top_dy = new_rect[1] - client.rect[1];
+        let bottom_dy = (new_rect[1] + new_rect[3]) - (client.rect[1] + client.rect[3]);
+
+        let (edge_x, dx) = if left_dx.abs() >= right_dx.abs() {
+            (-1, left_dx)
         } else {
-            let dx = new_rect[2] - client.rect[2];
-            let dy = new_rect[3] - client.rect[3];
-            if dx.abs() > 4 || dy.abs() > 4 {
-                self.resize_window_immediate(hwnd, dx, dy);
+            (1, right_dx)
+        };
+        let (edge_y, dy) = if top_dy.abs() >= bottom_dy.abs() {
+            (-1, top_dy)
+        } else {
+            (1, bottom_dy)
+        };
+
+        if dx == 0 && dy == 0 {
+            return;
+        }
+
+        let (inner, gap) = tiled_inner_area(self.primary_work_area(), &self.config.general);
+        if self.config.general.layout.eq_ignore_ascii_case("master") {
+            let (horizontal, sign) = match self.config.master.orientation.as_str() {
+                "right" => (true, -1.0),
+                "top" => (false, 1.0),
+                "bottom" => (false, -1.0),
+                _ => (true, 1.0),
+            };
+            let (delta, extent) = if horizontal {
+                (dx, inner[2])
             } else {
-                self.relayout_active_workspace_immediate(None);
+                (dy, inner[3])
+            };
+            let extent = (extent - gap * 2).max(1) as f32;
+            self.config.master.mfact =
+                (self.config.master.mfact + sign * delta as f32 / extent).clamp(0.15, 0.85);
+            self.relayout_active_workspace_immediate(Some(hwnd));
+        } else {
+            let ws = self.active_workspace;
+            if let Some(tree) = self.workspace_bsp.get_mut(&ws) {
+                for (axis, edge, delta) in [
+                    (SplitAxis::Horizontal, edge_x, dx),
+                    (SplitAxis::Vertical, edge_y, dy),
+                ] {
+                    if delta != 0 && !tree.resize_edge(hwnd, axis, edge, delta, inner, gap) {
+                        tree.resize_edge(hwnd, axis, -edge, delta, inner, gap);
+                    }
+                }
             }
+            self.relayout_active_workspace_immediate(Some(hwnd));
+        }
+        if let Some(c) = self.clients.get_mut(&hwnd) {
+            c.rect = new_rect;
+        }
+    }
+
+    /// Handles the completion of a native Win32 border drag/resize (`EVENT_SYSTEM_MOVESIZEEND`)
+    /// so resizing a window by its border adjusts its tile ratio instead of snapping back.
+    pub(crate) fn handle_native_movesize_end(&mut self, hwnd: u64) {
+        if self.drag_target_hwnd.is_some() {
+            return;
+        }
+        self.handle_native_movesize_tick(hwnd);
+        let is_float = self
+            .clients
+            .get(&hwnd)
+            .map(|c| c.floating)
+            .unwrap_or(true);
+        if !is_float {
+            self.relayout_active_workspace_immediate(None);
         }
     }
 
@@ -355,14 +412,11 @@ impl WmState {
             live.push(hwnd);
         }
         self.live_sizing_hwnds = live;
-        send_sizing_notification(&self.live_sizing_hwnds, WM_ENTERSIZEMOVE);
     }
 
-    /// Ends live-resize mode (`WM_EXITSIZEMOVE`) so apps do their final layout pass, and gives
-    /// previewed windows their single real resize into the final layout.
+    /// Ends live-resize mode and gives previewed windows their single real resize into the final layout.
     pub(crate) fn end_live_sizing(&mut self) {
-        let hwnds = std::mem::take(&mut self.live_sizing_hwnds);
-        send_sizing_notification(&hwnds, WM_EXITSIZEMOVE);
+        self.live_sizing_hwnds.clear();
         let clients = &self.clients;
         self.animator
             .previews
@@ -393,23 +447,8 @@ impl WmState {
             let [x, y, w, h] = start_rect;
             let (nx, nw) = resize_span(x, w, edge_x, dx, 100);
             let (ny, nh) = resize_span(y, h, edge_y, dy, 80);
-            let mut r = [nx, ny, nw, nh];
+            let r = [nx, ny, nw, nh];
             self.animator.apply_immediate_batch(&[(hwnd, r)], false);
-            if let Some((aw, ah)) = visible_frame_size(hwnd) {
-                let mut fixed = r;
-                if edge_x < 0 && aw > nw + 1 {
-                    fixed[0] = x + w - aw;
-                    fixed[2] = aw;
-                }
-                if edge_y < 0 && ah > nh + 1 {
-                    fixed[1] = y + h - ah;
-                    fixed[3] = ah;
-                }
-                if fixed != r {
-                    r = fixed;
-                    self.animator.apply_immediate_batch(&[(hwnd, r)], false);
-                }
-            }
             if let Some(c) = self.clients.get_mut(&hwnd) {
                 c.rect = r;
             }

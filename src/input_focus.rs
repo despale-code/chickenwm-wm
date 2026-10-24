@@ -60,7 +60,12 @@ pub(crate) fn spawn_hover_focus_thread() -> std::io::Result<()> {
             let mut border_drag_anchor: Option<(i32, i32)> = None;
 
             loop {
-                thread::sleep(std::time::Duration::from_millis(8));
+                let sleep_ms = if BORDER_DRAG_ACTIVE.load(Ordering::Relaxed) {
+                    2
+                } else {
+                    8
+                };
+                thread::sleep(std::time::Duration::from_millis(sleep_ms));
                 let mut pt = POINT::default();
                 unsafe {
                     if GetCursorPos(&mut pt).is_err() {

@@ -334,8 +334,6 @@ impl AnimationEngine {
 
         if (start_f32[0] - target_f32[0]).abs() < 1.0
             && (start_f32[1] - target_f32[1]).abs() < 1.0
-            && (start_f32[2] - target_f32[2]).abs() < 1.0
-            && (start_f32[3] - target_f32[3]).abs() < 1.0
         {
             self.active.remove(&hwnd);
             apply_atomic_window_positions(&[(hwnd, target_rect)], false);
@@ -351,8 +349,8 @@ impl AnimationEngine {
                 current_rect: [
                     start_f32[0] as i32,
                     start_f32[1] as i32,
-                    start_f32[2] as i32,
-                    start_f32[3] as i32,
+                    target_rect[2],
+                    target_rect[3],
                 ],
                 elapsed_secs: 0.0,
                 duration_secs,
@@ -374,18 +372,20 @@ impl AnimationEngine {
 
         let mut final_batch = Vec::new();
         for (&hwnd, anim) in self.active.iter_mut() {
-            let prev = anim.current_rect;
-            // The start rect isn't necessarily the window's real size, so the first frame sizes it.
+            // Apply target size on the first frame so the app reallocates its swapchain at most once,
+            // then hardware-glide position on subsequent frames with SWP_NOSIZE.
             let first_frame = anim.elapsed_secs == 0.0;
-            let rect = anim.step(dt);
+            let mut rect = anim.step(dt);
+            rect[2] = (anim.target_rect[2].round() as i32).max(50);
+            rect[3] = (anim.target_rect[3].round() as i32).max(40);
+            anim.current_rect = rect;
             current_visible_rects.push((hwnd, rect));
 
             if anim.is_finished() {
                 finished.push(hwnd);
                 final_batch.push((hwnd, rect));
             } else {
-                let resized = first_frame || prev[2] != rect[2] || prev[3] != rect[3];
-                commit_batch.push((hwnd, rect, resized));
+                commit_batch.push((hwnd, rect, first_frame));
             }
         }
 
@@ -407,6 +407,11 @@ impl AnimationEngine {
         }
 
         current_visible_rects
+    }
+
+    pub fn cancel_window(&mut self, hwnd: u64) {
+        self.active.remove(&hwnd);
+        self.hide_on_finish.remove(&hwnd);
     }
 
     pub fn remove_window(&mut self, hwnd: u64) {
@@ -449,25 +454,55 @@ pub fn apply_atomic_window_positions(positions: &[(u64, [i32; 4])], move_only: b
     // Electron/Chromium apps especially) and DefWindowProc clamp to their minimum track size.
     // Without it a tile narrower than the app's minimum would overflow into its neighbours.
     // SWP_ASYNCWINDOWPOS ensures the calling thread never halts waiting for a foreign app's UI thread.
-    let mut flags = SWP_NOZORDER
+    let base_flags = SWP_NOZORDER
         | SWP_NOACTIVATE
         | SWP_NOOWNERZORDER
         | SWP_NOSENDCHANGING
         | SWP_ASYNCWINDOWPOS;
-    if move_only {
-        flags |= SWP_NOSIZE;
-    } else {
-        flags |= SWP_NOCOPYBITS;
-    }
 
     unsafe {
-        if positions.len() > 1 {
-            if let Ok(mut hdwp) = BeginDeferWindowPos(positions.len() as i32) {
+        let mut filtered = Vec::with_capacity(positions.len());
+        for &(hwnd_u64, visible_rect) in positions {
+            let [x, y, raw_w, raw_h] = compensate_dwm_frame_bounds(hwnd_u64, visible_rect);
+            let w = raw_w.max(50);
+            let h = raw_h.max(40);
+            let hwnd = HWND(hwnd_u64 as *mut core::ffi::c_void);
+            let mut cur_rc = RECT::default();
+            let mut flags = base_flags;
+            if move_only {
+                flags |= SWP_NOSIZE;
+                if GetWindowRect(hwnd, &mut cur_rc).is_ok()
+                    && cur_rc.left == x
+                    && cur_rc.top == y
+                {
+                    continue;
+                }
+            } else if GetWindowRect(hwnd, &mut cur_rc).is_ok() {
+                let cur_w = cur_rc.right - cur_rc.left;
+                let cur_h = cur_rc.bottom - cur_rc.top;
+                if cur_rc.left == x && cur_rc.top == y && cur_w == w && cur_h == h {
+                    continue;
+                }
+                if cur_w == w && cur_h == h {
+                    flags |= SWP_NOSIZE;
+                } else {
+                    flags |= SWP_NOCOPYBITS;
+                }
+            } else {
+                flags |= SWP_NOCOPYBITS;
+            }
+            filtered.push((hwnd, x, y, w, h, flags));
+        }
+
+        if filtered.is_empty() {
+            return;
+        }
+
+        if filtered.len() > 1 {
+            if let Ok(mut hdwp) = BeginDeferWindowPos(filtered.len() as i32) {
                 let mut deferred_ok = true;
-                for &(hwnd_u64, visible_rect) in positions {
-                    let [x, y, w, h] = compensate_dwm_frame_bounds(hwnd_u64, visible_rect);
-                    let hwnd = HWND(hwnd_u64 as *mut core::ffi::c_void);
-                    match DeferWindowPos(hdwp, hwnd, None, x, y, w.max(50), h.max(40), flags) {
+                for &(hwnd, x, y, w, h, flags) in &filtered {
+                    match DeferWindowPos(hdwp, hwnd, None, x, y, w, h, flags) {
                         Ok(new_hdwp) if !new_hdwp.is_invalid() => {
                             hdwp = new_hdwp;
                         }
@@ -484,10 +519,8 @@ pub fn apply_atomic_window_positions(positions: &[(u64, [i32; 4])], move_only: b
             }
         }
 
-        for &(hwnd_u64, visible_rect) in positions {
-            let [x, y, w, h] = compensate_dwm_frame_bounds(hwnd_u64, visible_rect);
-            let hwnd = HWND(hwnd_u64 as *mut core::ffi::c_void);
-            let _ = SetWindowPos(hwnd, None, x, y, w.max(50), h.max(40), flags);
+        for &(hwnd, x, y, w, h, flags) in &filtered {
+            let _ = SetWindowPos(hwnd, None, x, y, w, h, flags);
         }
     }
 }

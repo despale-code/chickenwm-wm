@@ -1140,6 +1140,7 @@ fn inspect_window(hwnd_u64: u64) -> Option<ClientInfo> {
 
         if process_name.eq_ignore_ascii_case("chickenwm-launcher.exe")
             || process_name.eq_ignore_ascii_case("chickenwm-notify.exe")
+            || process_name.eq_ignore_ascii_case("chickenwm-downloader.exe")
             || process_name.eq_ignore_ascii_case("roobar.exe")
             || title.starts_with("ChickenWM Bar")
         {
@@ -1507,7 +1508,13 @@ async fn main() -> Result<()> {
                         }
                     }
                     WmEvent::WinMoveSizeStart(h) => {
-                        st.animator.remove_window(h);
+                        st.animator.cancel_window(h);
+                        if crate::drag_resize::BORDER_DRAG_ACTIVE.swap(false, Ordering::AcqRel) {
+                            st.end_live_sizing();
+                            st.drag_session = None;
+                            st.drag_target_hwnd = None;
+                            st.drag_visual_rect = None;
+                        }
                         st.native_movesize = Some(h);
                     }
                     WmEvent::WinMoveSizeEnd(h) => {
@@ -1518,7 +1525,9 @@ async fn main() -> Result<()> {
                         st.handle_mouse_hover(x, y);
                     }
                     WmEvent::BorderDragStart { x, y } => {
-                        st.try_begin_border_drag(x, y);
+                        if st.native_movesize.is_none() {
+                            st.try_begin_border_drag(x, y);
+                        }
                     }
                     WmEvent::BorderDragMove {
                         start_x,
@@ -1589,18 +1598,23 @@ async fn main() -> Result<()> {
                 }
             }
 
-            let has_active_anims = {
-                let st = wm_loop.lock();
-                st.animator.has_active_animations()
-                    || st.drag_target_hwnd.is_some()
-                    || st.native_movesize.is_some()
-                    || st.focus_fading()
+            let (has_active_anims, has_native_movesize) = {
+                let mut st = wm_loop.lock();
+                if let Some(h) = st.native_movesize {
+                    st.handle_native_movesize_tick(h);
+                }
+                (
+                    st.animator.has_active_animations(),
+                    st.native_movesize.is_some(),
+                )
             };
             let dt = if has_active_anims {
                 scheduler.wait_for_next_frame(true)
+            } else if has_native_movesize {
+                scheduler.wait_for_next_frame_timer(true)
             } else {
-                // Idle: sleep until a window message or a WM event (posted by send_wm_event)
-                // arrives, instead of a condvar that window messages can't wake.
+                // Idle or event-driven interactive drag/resize: sleep until a window message or
+                // a WM event (posted by send_wm_event) arrives, waking in <0.05ms.
                 unsafe {
                     let _ = MsgWaitForMultipleObjects(None, false, 250, QS_ALLINPUT);
                 }
