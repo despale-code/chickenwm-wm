@@ -337,14 +337,17 @@ impl WmState {
             let hit = WindowFromPoint(POINT { x, y });
             if !hit.0.is_null() {
                 let root = GetAncestor(hit, GA_ROOT);
-                let root_u64 = if !root.0.is_null() {
-                    root.0 as u64
-                } else {
-                    hit.0 as u64
-                };
+                let root_hwnd = if !root.0.is_null() { root } else { hit };
+                let root_u64 = root_hwnd.0 as u64;
                 if let Some(c) = self.clients.get(&root_u64) {
                     if c.workspace_id == ws {
                         return Some(root_u64);
+                    }
+                } else {
+                    let ex_style = GetWindowLongPtrW(root_hwnd, GWL_EXSTYLE) as u32;
+                    if (ex_style & WS_EX_TOPMOST.0) != 0 {
+                        // Topmost overlay (e.g. coop Exposé canvas, roobar popover, launcher) is intercepting input here
+                        return None;
                     }
                 }
             }

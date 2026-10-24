@@ -84,20 +84,37 @@ impl WmState {
         for id in 1..=10 {
             let mut count = 0usize;
             let mut focused_title = None;
+            let mut client_hwnds = Vec::new();
+            if let Some(order) = self.workspace_order.get(&id) {
+                for &h in order {
+                    if let Some(c) = self.clients.get(&h) {
+                        if c.workspace_id == id && !client_hwnds.contains(&h) {
+                            client_hwnds.push(h);
+                        }
+                    }
+                }
+            }
+            let mut extra_hwnds = Vec::new();
             for c in self.clients.values() {
                 if c.workspace_id == id {
                     count += 1;
                     if c.focused || focused_title.is_none() {
                         focused_title = Some(c.title.clone());
                     }
+                    if !client_hwnds.contains(&c.hwnd) {
+                        extra_hwnds.push(c.hwnd);
+                    }
                 }
             }
+            extra_hwnds.sort_unstable();
+            client_hwnds.extend(extra_hwnds);
             workspaces.push(WorkspaceSummary {
                 id,
                 active: id == self.active_workspace,
                 occupied: count > 0,
                 client_count: count,
                 focused_title,
+                client_hwnds,
             });
         }
 
