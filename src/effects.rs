@@ -45,14 +45,16 @@ pub fn disable_native_dwm_transitions(hwnd_u64: u64) {
     }
 }
 
-/// Removes every native frame of a managed window so only ChickenWM's border is visible:
-/// the Windows 11 DWM border (`DWMWA_BORDER_COLOR` = none) and, when `strip_styles` is set, the
-/// caption and the thick resize frame (which DWM paints as a light strip along the top edge).
-/// Returns true if the window's style bits had to change (its client area moved).
-pub fn strip_native_frame(hwnd_u64: u64, strip_styles: bool) -> bool {
+/// Hides the native 1px Windows 11 DWM border (`DWMWA_BORDER_COLOR = DWMWA_COLOR_NONE`) so only
+/// ChickenWM / `coop`'s border is visible, without stripping `WS_CAPTION | WS_THICKFRAME`
+/// (stripping `WS_CAPTION | WS_THICKFRAME` breaks Chromium/Electron `WM_NCCALCSIZE` handlers and
+/// causes `user32.dll` to paint a classic Win95 fallback titlebar and thick grey border).
+/// Also heals any non-popup window whose `WS_CAPTION | WS_THICKFRAME` was previously stripped.
+pub fn strip_native_frame(hwnd_u64: u64, _strip_styles: bool) -> bool {
     let hwnd = HWND(hwnd_u64 as *mut core::ffi::c_void);
     unsafe {
-        let none: u32 = 0xFFFF_FFFE; // DWMWA_COLOR_NONE
+        let none: u32 = 0xFFFF_FFFE; // DWMWA_COLOR_NONE (valid only for DWMWA_BORDER_COLOR)
+        let default_color: u32 = 0xFFFF_FFFF; // DWMWA_COLOR_DEFAULT
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_BORDER_COLOR,
@@ -62,34 +64,33 @@ pub fn strip_native_frame(hwnd_u64: u64, strip_styles: bool) -> bool {
         let _ = DwmSetWindowAttribute(
             hwnd,
             windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(35), // DWMWA_CAPTION_COLOR
-            &none as *const u32 as *const core::ffi::c_void,
+            &default_color as *const u32 as *const core::ffi::c_void,
             size_of::<u32>() as u32,
         );
         let _ = DwmSetWindowAttribute(
             hwnd,
             windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(36), // DWMWA_TEXT_COLOR
-            &none as *const u32 as *const core::ffi::c_void,
+            &default_color as *const u32 as *const core::ffi::c_void,
             size_of::<u32>() as u32,
         );
-        if !strip_styles {
-            return false;
-        }
+
         let cur = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
         let frame = WS_CAPTION.0 | WS_THICKFRAME.0;
-        if cur & frame == 0 {
-            return false;
+        if (cur & WS_POPUP.0) == 0 && (cur & frame) != frame {
+            let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, (cur | frame) as isize);
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+            crate::animator::invalidate_dwm_frame_margins(hwnd_u64);
+            return true;
         }
-        let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, (cur & !frame) as isize);
-        let _ = SetWindowPos(
-            hwnd,
-            None,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-        );
-        true
+        false
     }
 }
 
